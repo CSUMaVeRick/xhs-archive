@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>XHS 归档管理</title>
+  <link rel="stylesheet" href="manage.css" />
+</head>
+<body>
+  <header>
+    <span class="logo">📕</span>
+    <h1>小红书归档管理</h1>
+    <button id="pick-dir" class="btn">选择归档目录</button>
+  </header>
+
+  <div id="toolbar" class="toolbar">
+    <input id="search" class="search" type="text" placeholder="搜索标题 / 标签 / 作者..." />
+    <span id="count" class="count"></span>
+  </div>
+
+  <div id="list" class="list"></div>
+  <div id="empty" class="empty" style="display:none">请选择归档目录开始浏览</div>
+
+  <!-- 预览抽屉 -->
+  <div id="preview" class="preview" hidden>
+    <button id="close-preview" class="close">×</button>
+    <div id="preview-content"></div>
+  </div>
+
+  <script src="manage.js"></script>
+</body>
+</html>

@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8" />
+  <title>XHS Archive</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <span class="logo">📕</span>
+    <span class="title">XHS Archive</span>
+  </header>
+
+  <section class="card">
+    <div class="label">当前笔记</div>
+    <div id="note-info" class="note-info">（尚未在本页面抓到笔记）</div>
+  </section>
+
+  <section class="card">
+    <div class="label">归档目录</div>
+    <button id="pick-dir" class="btn">选择 / 切换归档目录</button>
+    <div id="dir-status" class="dir-status">未选择</div>
+  </section>
+
+  <section class="card">
+    <div class="label">视频保存画质</div>
+    <select id="video-quality" class="select">
+      <option value="autobest">最高画质（最清晰）</option>
+      <option value="1080p">1080P 高清</option>
+      <option value="720p">720P 标准（省空间）</option>
+      <option value="cover">仅封面（不下载视频，最省）</option>
+    </select>
+    <div class="dir-status">选择后点击「归档」生效</div>
+  </section>
+
+  <section class="card">
+    <div class="label">页面归档按钮</div>
+    <select id="panel-mode" class="select">
+      <option value="collapsed">折叠工具栏（默认，不挡视线）</option>
+      <option value="expanded">展开详情面板</option>
+    </select>
+    <div class="dir-status">控制小红书页面上的归档按钮形态</div>
+  </section>
+
+  <button id="archive" class="btn primary">归档当前笔记</button>
+  <button id="open-manage" class="btn">打开归档管理</button>
+
+  <div id="status" class="status"></div>
+
+  <script src="content/card.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

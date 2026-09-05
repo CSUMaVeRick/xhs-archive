@@ -1,0 +1,53 @@
+{
+  "manifest_version": 3,
+  "name": "XHS Archive",
+  "version": "0.1.0",
+  "description": "从小红书帖子页抽取数据，用于本地归档。当前为数据抽取原型。",
+  "permissions": ["downloads", "storage", "declarativeNetRequest"],
+  "host_permissions": [
+    "https://www.xiaohongshu.com/*",
+    "https://*.xiaohongshu.com/*",
+    "http://*.xhscdn.com/*",
+    "https://*.xhscdn.com/*",
+    "https://fe-static.xhscdn.com/*"
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "xhs-referer",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "options_ui": {
+    "page": "manage.html",
+    "open_in_tab": true
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.xiaohongshu.com/*",
+        "https://*.xiaohongshu.com/*"
+      ],
+      "js": ["content/network.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.xiaohongshu.com/*",
+        "https://*.xiaohongshu.com/*"
+      ],
+      "js": ["content/card.js", "content/extract.js", "content/archive.js", "content/main.js"],
+      "css": ["content/debug-panel.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

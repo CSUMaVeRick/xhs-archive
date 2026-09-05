@@ -1,0 +1,13 @@
+# --- 浏览器生成缓存，不要提交 ---
+_metadata/
+
+# --- 系统 / 编辑器 ---
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+
+# --- 若将来引入构建工具/依赖 ---
+node_modules/
+dist/
+build/
