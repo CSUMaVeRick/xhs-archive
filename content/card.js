@@ -17,7 +17,8 @@
     const items = [
       ['赞', s.likeCount], ['收藏', s.collectCount], ['评论', s.commentCount], ['分享', s.shareCount],
     ];
-    return items.map(([k, v]) => `<div class="stat"><span class="n">${esc(v || 0)}</span><span class="k">${k}</span></div>`).join('');
+    // 统计数缺失时显示 "—"：0 与"没抓到"在研究场景里含义完全不同
+    return items.map(([k, v]) => `<div class="stat"><span class="n">${v == null ? '—' : esc(v)}</span><span class="k">${k}</span></div>`).join('');
   }
 
   function imagesHtml(imageFiles) {

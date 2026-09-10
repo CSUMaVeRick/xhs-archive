@@ -14,6 +14,7 @@
   <section class="card">
     <div class="label">当前笔记</div>
     <div id="note-info" class="note-info">（尚未在本页面抓到笔记）</div>
+    <div id="note-quality" class="dir-status"></div>
   </section>
 
   <section class="card">
@@ -34,6 +35,15 @@
   </section>
 
   <section class="card">
+    <div class="label">评论采集</div>
+    <select id="collect-comments" class="select">
+      <option value="off">关闭（默认）</option>
+      <option value="on">开启</option>
+    </select>
+    <div class="dir-status">开启后，笔记详情面板里会出现「展开评论」按钮——那是插件里唯一一处会替你点击页面的功能，默认关闭；展开时可在面板上限定条数或随时停止</div>
+  </section>
+
+  <section class="card">
     <div class="label">页面归档按钮</div>
     <select id="panel-mode" class="select">
       <option value="collapsed">折叠工具栏（默认，不挡视线）</option>
@@ -42,11 +52,19 @@
     <div class="dir-status">控制小红书页面上的归档按钮形态</div>
   </section>
 
+  <section class="card">
+    <div class="label">采集者 / 账号标识（可选）</div>
+    <input id="collector-id" class="input" type="text" placeholder="采集者 ID" />
+    <input id="account-label" class="input" type="text" placeholder="账号标识，如 账号A" />
+    <div class="dir-status">写入每条归档的 _collection，用于区分样本由谁、用哪个账号采集</div>
+  </section>
+
   <button id="archive" class="btn primary">归档当前笔记</button>
   <button id="open-manage" class="btn">打开归档管理</button>
 
   <div id="status" class="status"></div>
 
+  <script src="content/schema.js"></script>
   <script src="content/card.js"></script>
   <script src="popup.js"></script>
 </body>

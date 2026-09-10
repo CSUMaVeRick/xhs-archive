@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "XHS Archive",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "从小红书帖子页抽取数据，用于本地归档。当前为数据抽取原型。",
   "permissions": ["downloads", "storage", "declarativeNetRequest"],
   "host_permissions": [
@@ -45,7 +45,7 @@
         "https://www.xiaohongshu.com/*",
         "https://*.xiaohongshu.com/*"
       ],
-      "js": ["content/card.js", "content/extract.js", "content/archive.js", "content/main.js"],
+      "js": ["content/schema.js", "content/card.js", "content/extract.js", "content/archive.js", "content/main.js"],
       "css": ["content/debug-panel.css"],
       "run_at": "document_idle"
     }

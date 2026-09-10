@@ -56,7 +56,19 @@ header {
   background: #fff;
 }
 
-.dir-status { font-size: 11px; color: #999; word-break: break-all; }
+.input {
+  width: 100%;
+  padding: 8px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  font-size: 13px;
+  margin-bottom: 6px;
+  background: #fff;
+  box-sizing: border-box;
+}
+.input:focus { outline: none; border-color: #ff2442; }
+
+.dir-status { font-size: 11px; color: #999; word-break: break-all; white-space: pre-wrap; }
 
 .status {
   margin-top: 8px;

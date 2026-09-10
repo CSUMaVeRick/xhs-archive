@@ -99,11 +99,16 @@
 #xhs-panel .xr-row { display: flex; gap: 8px; padding: 3px 0; border-bottom: 1px dashed #f0f0f0; }
 #xhs-panel .xr-k { flex: 0 0 64px; color: #999; }
 #xhs-panel .xr-v { flex: 1; word-break: break-all; color: #333; }
-#xhs-panel .xr-dl { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-top: 1px solid #f0f0f0; }
+#xhs-panel .xr-dl { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-top: 1px solid #f0f0f0; }
 #xhs-panel .xr-dlbtn { background: #ff2442; color: #fff; border: none; padding: 7px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; }
 #xhs-panel .xr-dlbtn:hover { background: #e21e37; }
+#xhs-panel .xr-dlbtn.xr-copy, #xhs-panel .xr-dlbtn.xr-dl-author { background: #f2f2f2; color: #333; }
+#xhs-panel .xr-dlbtn.xr-copy:hover, #xhs-panel .xr-dlbtn.xr-dl-author:hover { background: #e8e8e8; }
 #xhs-panel .xr-dlstatus { font-size: 11px; color: #999; word-break: break-all; flex: 1; }
 #xhs-panel .xr-detail { padding: 0 12px 8px; }
+#xhs-panel .xr-expand { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-top: 1px dashed #f0f0f0; background: #fffdf5; }
+#xhs-panel .xr-expand-scope { padding: 5px 6px; border: 1px solid #ddd; border-radius: 6px; font-size: 12px; background: #fff; }
+#xhs-panel .xr-expand-status { font-size: 11px; color: #b26a00; flex: 1; word-break: break-all; }
 #xhs-panel .xr-detail summary { cursor: pointer; color: #ff2442; font-size: 12px; }
 #xhs-panel .xr-detail pre {
   margin: 6px 0 0;
