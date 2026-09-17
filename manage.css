@@ -224,7 +224,59 @@ h1 { font-size: 18px; margin: 0; flex: 1; }
 }
 .tab.active { background: #fff; color: #ff2442; font-weight: 600; border-color: #ffd3da; }
 .tab-num { font-size: 12px; color: #999; margin-left: 4px; }
-#notes-view, #authors-view { padding-top: 8px; }
+#notes-view, #authors-view, #batches-view { padding-top: 8px; }
+
+/* ---------- 检索批次 ---------- */
+.batch-list { padding: 0 24px 40px; }
+.batch-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: #fff;
+  border-radius: 10px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.04);
+}
+.batch-row:hover { background: #fff8f9; }
+.batch-row-main { flex: 1; min-width: 0; }
+.batch-row-title { font-weight: 600; font-size: 14px; margin-bottom: 4px; word-break: break-all; }
+.batch-row-file { font-weight: 400; font-size: 11px; color: #bbb; margin-left: 6px; }
+.batch-row-meta { font-size: 12px; color: #999; word-break: break-all; }
+
+.batch-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 12px;
+  padding: 0 24px 40px;
+}
+.batch-card {
+  position: relative;
+  background: #fff;
+  border-radius: 10px;
+  padding: 10px;
+  box-shadow: 0 1px 6px rgba(0,0,0,0.05);
+}
+/* 未勾选的卡片压暗：一眼能看出哪些已经挑过 */
+.batch-card:not(.batch-card-other):has(.batch-cb:not(:checked)) { opacity: .55; }
+.batch-card-other { background: #f9fafb; }
+.batch-check { position: absolute; top: 6px; right: 6px; z-index: 2; background: rgba(255,255,255,.9); border-radius: 6px; padding: 2px 4px; cursor: pointer; }
+.batch-check input { cursor: pointer; width: 16px; height: 16px; }
+.batch-rank { position: absolute; top: 6px; left: 6px; z-index: 2; font-size: 11px; color: #fff; background: rgba(0,0,0,.55); border-radius: 6px; padding: 1px 6px; }
+.batch-cover-wrap { position: relative; width: 100%; aspect-ratio: 3 / 4; background: #f2f2f2; border-radius: 8px; overflow: hidden; }
+.batch-cover { width: 100%; height: 100%; object-fit: cover; display: block; }
+.batch-cover-ph { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; color: #bbb; }
+/* 类选择器会盖过 UA 的 [hidden]，必须显式写一条，否则占位会一直压在图上面 */
+.batch-cover-ph[hidden] { display: none; }
+.batch-title { font-size: 13px; font-weight: 600; margin: 8px 0 4px; line-height: 1.4; max-height: 3.6em; overflow: hidden; }
+.batch-meta { font-size: 11px; color: #999; word-break: break-all; }
+/* 日期冲突：id 与卡片文字打架。要显眼——它意味着时间字段可能整体不可信 */
+.batch-conflict { margin-top: 4px; font-size: 11px; color: #7f1d1d; background: #fee2e2; padding: 2px 6px; border-radius: 6px; }
+.batch-links { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; font-size: 11px; }
+.batch-links a { color: #ff2442; }
+.batch-kind { color: #999; }
+.batch-other-body { padding: 4px 0 0; }
 
 /* ---------- 作者表 ---------- */
 .author-list { padding: 0 24px 40px; }

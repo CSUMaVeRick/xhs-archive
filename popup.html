@@ -59,6 +59,17 @@
     <div class="dir-status">写入每条归档的 _collection，用于区分样本由谁、用哪个账号采集</div>
   </section>
 
+  <section class="card">
+    <div class="label">搜索结果页粗糙采集</div>
+    <div class="row">
+      <input id="search-rounds" class="input" type="number" min="1" step="1" placeholder="滚动次数" />
+      <input id="search-interval" class="input" type="number" min="500" step="100" placeholder="间隔(毫秒)" />
+    </div>
+    <button id="search-start" class="btn">开始采集</button>
+    <button id="search-stop" class="btn" disabled>停止</button>
+    <div id="search-status" class="dir-status">在<strong>搜索结果页</strong>上使用：插件替你滚动指定次数，把每次翻页的结果记下来，存成 searches 目录下的一份清单。不写评论、不下载图片集，只存封面。</div>
+  </section>
+
   <button id="archive" class="btn primary">归档当前笔记</button>
   <button id="open-manage" class="btn">打开归档管理</button>
 

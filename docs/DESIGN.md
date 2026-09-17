@@ -539,6 +539,8 @@ P0 已实现：插件版本 `0.2.0`，`_schemaVersion = 2`。下表列出实现�
 | 主页属性解析改为"按元素限定"（实测 bug） | 第一版把 `小红书号` / `IP属地` 放在 `document.body.textContent` 上跑正则，而 `textContent` 会把**相邻元素直接拼起来**（没有分隔符）——实测属地解析成了 `四川◇985法学博士`（简介开头的字符被粘上来）。现在统一用"命中关键词且文本最短的元素"取文本，再配窄字符类（属地只收中日韩/字母 2–12 字） |
 | 数据文件不放注释字段 | 早期版本在 `authors.json` 根部写了 `_readme` 说明。数据文件里不该有注释（pandas 读进来会多一个键），说明改放 README；写盘时会顺带清掉历史遗留的 `_readme`，人工加的根字段不受影响 |
 | 工具栏在作者主页也要显示（实测 bug） | `detectNoteVisible()` 原本只认"笔记页/笔记容器/笔记缓存"，作者主页三者皆无 → 工具栏整个消失，点开一条笔记才出现。现在把"在作者主页"也算作可操作页面 |
+| 热词/推荐词条目加一道防御闸门（Phase 0 实测修正） | 曾据合成的假想载荷判断"热词条目会被 `looksLikeNote()` 当成笔记收进 `MAP`"。**实测推翻**：平台的热词条目标题嵌在 `hot_query.title` 里，外层没有 `title`；`note_card` 也没有 `id`——所以检索响应本来就不会往 `MAP` 里塞东西。防御仍然保留（`isNonNoteItem()`：平台用 `model_type` 自报类别，不含 `note` 的一律不收），但它在当前形状下不修任何可见缺陷，测试标签也相应改成"防御"而不是"修复" |
+| 检索页采集诊断探针（Phase 0，**已按计划删除**） | 取证期间用过 `content/search-probe.js` + 弹窗按钮，只读：捕获检索接口的请求 body 与响应结构摘要、并采样结果页 DOM（卡片容器与类名、是否有发布时间、虚拟化信号、筛选控件）。接口闸门复用 `network.js` 的 `isXhsApiUrl`。三轮取证后已删除：探针文件、manifest 的 js 项、`main.js` 的面板按钮、弹窗按钮、`network.js` 末尾的 `__XHS_NETWORK_IS_API__` 导出。结论与数据契约见 `docs/DESIGN-search-hits.md` |
 | 管理页不再无条件自动扫描目录 | 目录句柄持久，但**浏览器重启后授权会退回 `prompt`**，此时任何目录操作都抛 `NotAllowedError`。改为先用 `queryPermission({mode:'read'})` 判断，未授权时给出"点「选择归档目录」重新授权"的指引而不是硬扫；`walkDir` 的 catch 也改为打印 `name`/`message`（DOMException 直接 toString 只有 `[object DOMException]`，等于没报），并按 `NotAllowedError`/`NotFoundError` 给出可读提示 |
 | `noteIdMismatch` 同时覆盖 `__INITIAL_STATE__` 路径 | 实现时发现 `resolveNoteFromState()` 在 URL 的 noteId 不在 `noteDetailMap` 中时会取**第一个**条目，同样可能选中别的笔记 |
 | 新增 `_statsRaw` | "0 与未知不可分"的问题需要保留原始文本（如 `"1.2万"`）才能事后审计 |
@@ -574,6 +576,8 @@ P0 已实现：插件版本 `0.2.0`，`_schemaVersion = 2`。下表列出实现�
 | 检索页的 `source` 参数是不是入口 | 实测为**否**：是版式水印 | 用户提供的真实 URL：检索页 `/search_result_ai?keyword=%25E6%259C%259F…&source=web_explore_feed`；从它点进笔记后 `/explore/<id>?xsec_source=pc_search&source=web_explore_feed` 两个参数并存。**已处理**：判据排序 + `typeSource` 留痕，见「实施状态」 |
 
 > ⚠️ **风险提示：** 本设计刻意把"采集"限制在被动读取页面已产生的响应。自行构造请求需要签名头[^3]，既脆弱又可能触发平台风控；自动翻页同样被排除。放弃 resultRank 的决定与此一致。
+>
+> 📌 后续新增的**搜索结果页粗糙采集**确实会替用户滚动，但它是另一套设计、另一套文件（`searches/*.jsonl`），且与本文档的归档路径**刻意不打通**：命中清单不回填 `metadata.json`，因此 `_source.resultRank` 在这里仍然恒为 `null`。见 `docs/DESIGN-search-hits.md`。
 
 ## 📌 后续阶段
 
@@ -581,6 +585,7 @@ P0 已实现：插件版本 `0.2.0`，`_schemaVersion = 2`。下表列出实现�
 | --- | --- |
 | P1 | ~~评论拦截与 `comments.json`~~（已完成）；作者信息机会性补全（已完成）；会话日志 CSV（**建议取消**：实质内容已由 `_imageOk/_imageFail/_videoOk` 覆盖，且追加写在 FSA 下有并发问题）；检索响应拦截以补齐 `sortOrder` 与 `resultRank`（用户已决定不做，改为管理页人工补录） |
 | P2 | DOM 桥与 MutationObserver 自触发回路优化；缓存上限与淘汰策略 |
+| P3 | 搜索结果页粗糙采集（**已实现**，插件 `0.3.0`）：在检索页按用户设定的次数与间隔滚动，把每次翻页的有序命中落成 `searches/*.jsonl` + 封面目录；管理页新增「检索批次」视图用于勾选与导出。实测数据与数据契约见 `docs/DESIGN-search-hits.md` |
 
 ## 🔗 参考资料
 

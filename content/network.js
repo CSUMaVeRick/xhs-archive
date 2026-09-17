@@ -29,8 +29,20 @@
   }
 
   // 判断一个对象是否是"笔记"：具备 id/noteId + 标题/正文/图片 任一特征
+  //
+  // ⚠ 但检索/推荐流响应里的热词与推荐词条目也有 id + title
+  // （实测结构：{ id, model_type: 'hot_query', title: '露营' }），会被上面的条件放进来。
+  // 它们不是笔记，进 MAP 就等于让"当前笔记"的候选池里混入垃圾——而 extract() 在 URL
+  // 的 noteId 匹配不上时会退化取"最近抓到的任意一条"，于是可能把热词当成本篇。
+  // 平台用 model_type 自己标了类别，认它即可：不含 "note" 的一律不收（note_video 之类仍收）。
+  function isNonNoteItem(o) {
+    const mt = o && (o.model_type || o.modelType);
+    return !!mt && !/note/i.test(String(mt));
+  }
+
   function looksLikeNote(o) {
     if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+    if (isNonNoteItem(o)) return false;
     const hasId = !!(o.id || o.noteId || o.note_id);
     const hasTitle = typeof o.title === 'string' && o.title.length > 0;
     const hasDesc = typeof o.desc === 'string' && o.desc.length > 0;
@@ -120,6 +132,159 @@
         document.documentElement.appendChild(sh);
       }
       sh.textContent = JSON.stringify(SEARCH_HINT);
+      // 检索结果批次（增量交接：内容脚本读完写回 ack，这里丢弃已消费的）
+      ackConsumed();
+      let hits = document.getElementById('xhs-search-hits');
+      if (!hits) {
+        hits = document.createElement('div');
+        hits.id = 'xhs-search-hits';
+        hits.style.display = 'none';
+        document.documentElement.appendChild(hits);
+      }
+      hits.textContent = JSON.stringify({
+        updatedAt: Date.now(),
+        dropped: SEARCH_DROPPED,
+        batches: SEARCH_BATCHES,
+      });
+    } catch (e) {
+      // 忽略
+    }
+  }
+
+  // ---------------- 检索结果通道（搜索结果页粗糙采集） ----------------
+  // 与笔记缓存（MAP）是两条独立通道，刻意不混：检索响应里有几十张薄卡片，
+  // 塞进 MAP 会挤掉详情卡片，并让"A 的元数据写进 B 目录"那类错标重新变得可能。
+  //
+  // 隔离 world 读不到页面变量，所以照旧走隐藏 DOM 节点；但这里是**增量**交接：
+  // 每批响应一个条目，内容脚本读完后写回已消费的序号，下次刷新时把已消费的丢掉。
+  // 不做增量的话，几百条规模下每次都要重写整块 JSON，还会放大 MutationObserver 自触发回路。
+  const SEARCH_NOTES_RE = /\/api\/[^?#]*search\/notes/i;
+  const REQ_BODIES = {};   // url -> 请求体（检索的页码与筛选参数在 body 里，POST）
+  const SEARCH_BATCHES = []; // 尚未被内容脚本取走的批次
+  const MAX_PENDING_BATCHES = 8; // 内容脚本几百毫秒内就会取走；留 8 批只为兜住短暂停顿
+  let SEARCH_SEQ = 0;
+  let SEARCH_DROPPED = 0;
+
+  function pickFirst(a, b) {
+    return a != null ? a : (b != null ? b : null);
+  }
+
+  // 请求体只在"检索结果接口"上读：别的接口（私信、埋点等）连 body 都不碰
+  function rememberSearchRequest(url, body) {
+    if (!url || !SEARCH_NOTES_RE.test(String(url))) return;
+    let parsed = null;
+    try {
+      if (typeof body === 'string' && body) parsed = JSON.parse(body);
+      else if (body && typeof body === 'object') parsed = body;
+    } catch (e) {
+      parsed = null;
+    }
+    if (!parsed || typeof parsed !== 'object') return;
+    REQ_BODIES[String(url)] = {
+      page: parsed.page, pageSize: parsed.page_size || parsed.pageSize,
+      keyword: parsed.keyword, sort: parsed.sort, noteType: parsed.note_type != null ? parsed.note_type : parsed.noteType,
+      searchId: parsed.search_id || parsed.searchId,
+      filters: Array.isArray(parsed.filters) ? parsed.filters : null,
+    };
+  }
+
+  // 只留用得上的字段：请求体与响应体都会进 DOM 节点，越瘦越好。
+  // ⚠ 这里也是唯一一处丢弃 interact_info.liked / collected 的地方——
+  // 它们是"当前登录账号有没有赞过、藏过"，属于浏览者状态，不是笔记属性，
+  // 让它们过桥就等于把"我看过什么"写进数据集。
+  function reduceHitItem(it) {
+    if (!it || typeof it !== 'object') return null;
+    const kind = String(it.model_type || it.modelType || ((it.note_card || it.noteCard) ? 'note' : 'other'));
+    const out = {
+      id: it.id || it.noteId || it.note_id || '',
+      model_type: kind,
+      xsec_token: it.xsec_token || '',
+    };
+    if (kind !== 'note') {
+      const hq = it.hot_query || it.hotQuery || null;
+      if (hq) {
+        out.hot_query = {
+          title: hq.title || '',
+          queries: (Array.isArray(hq.queries) ? hq.queries : []).map((q) => ({
+            name: (q && (q.name || q.search_word)) || '',
+            search_word: (q && q.search_word) || '',
+          })),
+        };
+      }
+      return out;
+    }
+    const c = it.note_card || it.noteCard || {};
+    const info = c.interact_info || c.interactInfo || {};
+    const u = c.user || {};
+    const imgs = c.image_list || c.imageList;
+    const tags = c.corner_tag_info || c.cornerTagInfo;
+    out.note_card = {
+      display_title: c.display_title || c.displayTitle || '',
+      type: c.type || '',
+      user: {
+        user_id: u.user_id || u.userId || '',
+        nickname: u.nickname || u.nick_name || '',
+        avatar: u.avatar || '',
+      },
+      interact_info: {
+        liked_count: pickFirst(info.liked_count, info.likedCount),
+        collected_count: pickFirst(info.collected_count, info.collectedCount),
+        comment_count: pickFirst(info.comment_count, info.commentCount),
+        shared_count: pickFirst(info.shared_count, info.sharedCount),
+      },
+      cover: { url_default: (c.cover && (c.cover.url_default || c.cover.urlDefault)) || '' },
+      image_list: Array.isArray(imgs) ? imgs.map((one) => {
+        const infos = one && (one.info_list || one.infoList);
+        return {
+          info_list: (Array.isArray(infos) ? infos : []).map((x) => ({
+            image_scene: x && x.image_scene,
+            url: x && x.url,
+          })),
+        };
+      }) : [],
+      corner_tag_info: Array.isArray(tags) ? tags.map((t) => ({
+        type: t && t.type,
+        text: t && t.text,
+      })) : [],
+    };
+    return out;
+  }
+
+  function ingestSearchBatch(json, url) {
+    if (!url || !SEARCH_NOTES_RE.test(String(url))) return false;
+    const d = (json && json.data) || {};
+    const items = Array.isArray(d.items) ? d.items : null;
+    if (!items) return false;
+    const req = REQ_BODIES[String(url)] || null;
+    const reduced = items.map(reduceHitItem).filter(Boolean);
+    SEARCH_BATCHES.push({
+      seq: ++SEARCH_SEQ,
+      at: Date.now(),
+      url: String(url).slice(0, 200),
+      req: req ? {
+        page: req.page, pageSize: req.pageSize, keyword: req.keyword,
+        sort: req.sort, noteType: req.noteType, searchId: req.searchId,
+        filters: req.filters,
+      } : null,
+      hasMore: d.has_more !== undefined ? !!d.has_more : null,
+      items: reduced,
+    });
+    while (SEARCH_BATCHES.length > MAX_PENDING_BATCHES) {
+      SEARCH_BATCHES.shift();
+      SEARCH_DROPPED++;
+    }
+    return true;
+  }
+
+  // 内容脚本取走批次后写回序号，这里据此丢弃已消费的
+  function ackConsumed() {
+    try {
+      const node = document.getElementById('xhs-search-hits-ack');
+      if (!node || !node.textContent) return;
+      const ack = JSON.parse(node.textContent);
+      const upto = Number(ack && ack.consumed);
+      if (!Number.isFinite(upto)) return;
+      while (SEARCH_BATCHES.length && SEARCH_BATCHES[0].seq <= upto) SEARCH_BATCHES.shift();
     } catch (e) {
       // 忽略
     }
@@ -127,7 +292,6 @@
 
   const URLS = []; // 拦截到的 xhs api url（去重 + 上限，纯粹给调试信息看）
   const MAX_URLS = 60;
-
   function rememberUrl(url) {
     if (!url) return;
     const u = String(url).slice(0, 160);
@@ -189,6 +353,7 @@
         }
       }
       if (changed) window.__XHS_NOTE_API__ = MAP;
+      ingestSearchBatch(json, url);
       ingestCommentApi(json, url);
       flushToDom(); // URL 列表也变了，无条件刷新（与原行为一致）
     } catch (e) {
@@ -204,6 +369,7 @@
       try {
         const url = typeof input === 'string' ? input : (input && input.url) || '';
         if (isXhsApiUrl(url)) {
+          rememberSearchRequest(url, init && init.body);
           p.then((resp) => {
             try {
               const ct = (resp.headers && resp.headers.get && resp.headers.get('content-type')) || '';
@@ -227,6 +393,7 @@
     return _open.apply(this, arguments);
   };
   XMLHttpRequest.prototype.send = function () {
+    try { rememberSearchRequest(this.__xhs_url, arguments[0]); } catch (e) { /* 忽略 */ }
     try {
       this.addEventListener('load', function () {
         try {
@@ -467,5 +634,6 @@
 
   window.__XHS_STATE_INGEST__ = ingestStateNote; // 供自检直接调用
   window.__XHS_INGEST__ = ingest; // 供自检验证"哪些接口会被处理"
+  window.__XHS_SEARCH_BATCHES__ = function () { return SEARCH_BATCHES; }; // 供自检
   ingestStateNote();  setInterval(ingestStateNote, 1500); // SPA 内切笔记时状态会更新，靠轮询兜住
 })();

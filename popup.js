@@ -373,6 +373,287 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   $('archive').addEventListener('click', performArchive);
 
+  // ---------- 搜索结果页粗糙采集 ----------
+  // 分工：采集与缓冲在内容脚本（弹窗关掉也继续），落盘在这里。
+  // 所以本弹窗每次打开都会先"补救"——把 storage 里还没写盘的分片写进批次文件。
+  const SEARCH_DIR = 'searches';
+
+  function searchSchema() { return window.XHS_SCHEMA || null; }
+
+  async function activeTabId() {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tab = tabs && tabs[0];
+    return tab && tab.id ? tab.id : null;
+  }
+
+  function sendToTab(tabId, msg) {
+    return new Promise((resolve, reject) => {
+      chrome.tabs.sendMessage(tabId, msg, (res) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error('页面没有响应，请刷新检索页后重试（' + (err.message || '') + '）'));
+        else if (!res) reject(new Error('页面没有返回数据，请刷新检索页后重试'));
+        else resolve(res);
+      });
+    });
+  }
+
+  async function listSearchStorage() {
+    const all = await chrome.storage.local.get(null);
+    const chunks = [];
+    const sessions = {};
+    for (const k of Object.keys(all)) {
+      if (k.indexOf('searchChunk:') === 0) chunks.push(Object.assign({ key: k }, all[k]));
+      else if (k.indexOf('searchSession:') === 0 && all[k] && all[k].sessionId) sessions[all[k].sessionId] = all[k];
+    }
+    return { all, chunks, sessions };
+  }
+
+  // 批次文件名只定一次；同名已存在就加序号，绝不覆盖已有文件。
+  // 文件名里的排序方式取 filters 里的 sort_type（用户实际应用的筛选），
+  // 而不是请求体里那个旧的 sort 标量——实测两者会矛盾（sort=general 而 filters 说 time_descending）。
+  async function ensureSearchFile(dir, sid, header) {
+    const key = 'searchFile:' + sid;
+    const saved = (await chrome.storage.local.get(key))[key];
+    if (saved && saved.name) return saved.name;
+    const sch = searchSchema();
+    let sortValue = header.sort || '';
+    const filters = Array.isArray(header.filters) ? header.filters : [];
+    const sortFilter = filters.find((f) => f && f.type === 'sort_type');
+    if (sortFilter && Array.isArray(sortFilter.tags) && sortFilter.tags.length) sortValue = sortFilter.tags[0];
+    const base = (sch && sch.searchFileName)
+      ? sch.searchFileName(header.keyword, header.startedAt, sortValue)
+      : ('batch_' + Date.now());
+    let name = base;
+    for (let i = 2; i <= 20; i++) {
+      let exists = false;
+      try {
+        await dir.getFileHandle(name + '.jsonl');
+        exists = true;
+      } catch (e) { exists = false; }
+      if (!exists) break;
+      name = base + '-' + i;
+    }
+    await chrome.storage.local.set({ [key]: { name: name } });
+    return name;
+  }
+
+  // 封面在写行之前下：这样行里的 coverFile 当场就是确定的，不留"以后补"
+  async function downloadCovers(dir, batchName, hits) {
+    const targets = hits.filter((h) => h.itemKind === 'note' && h.coverUrl && !h.coverFile);
+    const stat = { ok: 0, fail: 0 };
+    if (!targets.length) return stat;
+    const imgDir = await getDir(dir, batchName);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < targets.length) {
+        const h = targets[cursor];
+        cursor += 1;
+        const fname = String(h.seq).padStart(3, '0') + '_' + (h.noteId || 'note') + '.' + extFromUrl(h.coverUrl, 'jpg');
+        try {
+          const bytes = await fetchBytes(h.coverUrl);
+          await writeFile(imgDir, fname, bytes);
+          h.coverFile = fname;
+          stat.ok += 1;
+        } catch (e) {
+          stat.fail += 1; // 下不到就留 null，不假装有图
+        }
+      }
+    };
+    const n = Math.min(6, targets.length);
+    await Promise.all(Array.from({ length: n }, worker));
+    return stat;
+  }
+
+  // 把 storage 里所有待写分片写进对应的批次文件
+  async function drainSearchBuffer(root) {
+    const { chunks, sessions, all } = await listSearchStorage();
+    if (!chunks.length) return { hits: 0, sessions: 0, pending: 0 };
+    const bySession = {};
+    for (const c of chunks) {
+      if (!c.sessionId) continue;
+      (bySession[c.sessionId] = bySession[c.sessionId] || []).push(c);
+    }
+    const dir = await getDir(root, SEARCH_DIR);
+    let wroteHits = 0, wroteSessions = 0, leftPending = 0;
+    for (const sid of Object.keys(bySession)) {
+      const header = sessions[sid];
+      // 没有会话头就不写：宁可留在缓冲里，也不写进一份来源不明的文件
+      if (!header) { leftPending += bySession[sid].length; continue; }
+      // 还不知道检索词就先别建文件：会话头在采集开始那一刻就写了，那时 keyword 还是空的。
+      // 文件名一旦定下就不再改（会被缓存），所以必须等到第一个批次把 keyword 填进来。
+      // 采集已结束时不再等（避免永远写不出去），那时是真的没抓到检索词。
+      const capturing = all.searchProgress && all.searchProgress.sessionId === sid && all.searchProgress.active;
+      if (!header.keyword && capturing) { leftPending += bySession[sid].length; continue; }
+      const list = bySession[sid].slice().sort((a, b) => (a.index || 0) - (b.index || 0));
+      const name = await ensureSearchFile(dir, sid, header);
+      const fh = await dir.getFileHandle(name + '.jsonl', { create: true });
+      const file = await fh.getFile();
+      let text = await file.text();
+      if (!text) text = JSON.stringify(header) + '\n';
+      const hits = [];
+      for (const c of list) for (const h of (c.hits || [])) hits.push(h);
+      const coverStat = await downloadCovers(dir, name, hits);
+      const lines = hits.map((h) => JSON.stringify(h)).join('\n');
+      if (lines) text += lines + '\n';
+      const w = await fh.createWritable();
+      await w.write(text);
+      await w.close();
+      // 写成功了才删分片：中途失败时数据仍在，下次打开接着写
+      await chrome.storage.local.remove(list.map((c) => c.key));
+      // 封面成败累加到会话头（文件里的头在收尾时统一重写）
+      const coverBefore = (all['searchCover:' + sid] || { ok: 0, fail: 0 });
+      await chrome.storage.local.set({
+        ['searchCover:' + sid]: { ok: (coverBefore.ok || 0) + coverStat.ok, fail: (coverBefore.fail || 0) + coverStat.fail },
+        ['searchWritten:' + sid]: { hits: ((all['searchWritten:' + sid] || {}).hits || 0) + hits.length, updatedAt: new Date().toISOString() },
+      });
+      wroteHits += hits.length;
+      wroteSessions += 1;
+    }
+    return { hits: wroteHits, sessions: wroteSessions, pending: leftPending };
+  }
+
+  // 收尾：采集已结束且分片都写完了，才把会话头（第一行）重写成终值。
+  // 用 flag 防止每次轮询都重写一遍。
+  async function finalizeSearchSessions(root) {
+    const { chunks, sessions, all } = await listSearchStorage();
+    const pendingBy = {};
+    for (const c of chunks) pendingBy[c.sessionId] = (pendingBy[c.sessionId] || 0) + 1;
+    const prog = all.searchProgress || {};
+    // 只找不建：没有批次文件时不该因为一次收尾就在归档目录里建出 searches
+    let dir = null;
+    try { dir = await root.getDirectoryHandle(SEARCH_DIR); } catch (e) { dir = null; }
+    if (!dir) return 0;
+    let done = 0;
+    for (const sid of Object.keys(sessions)) {
+      if (pendingBy[sid]) continue;                                  // 还有分片没写
+      if (!prog || prog.sessionId !== sid || prog.active) continue;   // 采集还没结束
+      if (all['searchFinal:' + sid]) continue;                        // 已经收过尾
+      const saved = (all['searchFile:' + sid] || {}).name;
+      if (!saved) continue;
+      let fh;
+      try { fh = await dir.getFileHandle(saved + '.jsonl'); } catch (e) { continue; }
+      const text = await (await fh.getFile()).text();
+      const nl = text.indexOf('\n');
+      if (nl < 0) continue;
+      const written = text.slice(nl + 1).split('\n').filter(Boolean).length;
+      const cover = all['searchCover:' + sid] || { ok: 0, fail: 0 };
+      const head = Object.assign({}, sessions[sid], {
+        endedAt: prog.endedAt || sessions[sid].endedAt || null,
+        cover: { ok: cover.ok || 0, fail: cover.fail || 0 },
+        coverage: Object.assign({}, sessions[sid].coverage || {}, { writtenHits: written, complete: false }),
+      });
+      const w = await fh.createWritable();
+      await w.write(JSON.stringify(head) + text.slice(nl));
+      await w.close();
+      await chrome.storage.local.set({ ['searchFinal:' + sid]: { at: new Date().toISOString() } });
+      done += 1;
+    }
+    return done;
+  }
+
+  async function searchStatusLine() {
+    const all = await chrome.storage.local.get(null);
+    const prog = all.searchProgress || null;
+    let pending = 0;
+    for (const k of Object.keys(all)) if (k.indexOf('searchChunk:') === 0) pending += ((all[k] && all[k].hits) || []).length;
+    const written = prog && prog.sessionId ? ((all['searchWritten:' + prog.sessionId] || {}).hits || 0) : 0;
+    if (!prog) return { text: pending ? ('有 ' + pending + ' 条已采但未写盘，点「开始采集」或重新打开本弹窗会自动写入') : '尚未采集', active: false };
+    const lines = [];
+    if (prog.active) lines.push('采集中：已滚 ' + (prog.roundsDone || 0) + '/' + (prog.rounds || 0) + ' 次');
+    else lines.push('已结束' + (prog.stopReason ? '（' + prog.stopReason + '）' : ''));
+    lines.push('已采 ' + (prog.hitCount || 0) + ' 条（笔记 ' + (prog.noteCount || 0) + (prog.duplicateCount ? '，剔除重复 ' + prog.duplicateCount : '') + '）');
+    lines.push('已写盘 ' + written + ' 条' + (pending ? '，待写 ' + pending + ' 条' : ''));
+    if (prog.keyword) lines.push('检索词：' + prog.keyword);
+    if (prog.intervalWarning) lines.push('⚠ 间隔偏短（低于 1 秒不会更快拿到数据，只会更像自动化）');
+    if (prog.onSearchPage === false) lines.push('⚠ 当前地址不像搜索结果页；如果是从结果点进了笔记，滚动通常已经无效，建议回到检索页再采');    return { text: lines.join(' · '), active: !!prog.active };
+  }
+
+  let draining = false;
+  async function drainAndShow(root) {
+    if (draining) return;
+    draining = true;
+    try {
+      const res = await drainSearchBuffer(root);
+      await finalizeSearchSessions(root);
+      const st = await searchStatusLine();
+      const line = $('search-status');
+      if (line) line.textContent = st.text + (res.hits ? ('　（本次写入 ' + res.hits + ' 条）') : '');
+      $('search-start').disabled = st.active;
+      $('search-stop').disabled = !st.active;
+    } catch (e) {
+      const line = $('search-status');
+      if (line) line.textContent = '写入失败：' + String(e && e.message || e) + '（数据仍在，重新打开本弹窗会重试）';
+    } finally {
+      draining = false;
+    }
+  }
+
+  async function ensureSearchRoot() {
+    let root = await getRootHandle();
+    if (!root) throw new Error('请先选择归档目录');
+    root = await ensureWritePermission(root);
+    return root;
+  }
+
+  const storedRounds = await chrome.storage.local.get(['searchRounds', 'searchIntervalMs']);
+  const sch = searchSchema();
+  $('search-rounds').value = (storedRounds && storedRounds.searchRounds) || (sch ? sch.SEARCH_DEFAULT_ROUNDS : 5);
+  $('search-interval').value = (storedRounds && storedRounds.searchIntervalMs) || (sch ? sch.SEARCH_DEFAULT_INTERVAL_MS : 2000);
+  const saveSearchOpts = () => {
+    chrome.storage.local.set({
+      searchRounds: parseInt($('search-rounds').value, 10) || (sch ? sch.SEARCH_DEFAULT_ROUNDS : 5),
+      searchIntervalMs: parseInt($('search-interval').value, 10) || (sch ? sch.SEARCH_DEFAULT_INTERVAL_MS : 2000),
+    });
+  };
+  $('search-rounds').addEventListener('change', saveSearchOpts);
+  $('search-interval').addEventListener('change', saveSearchOpts);
+
+  $('search-start').addEventListener('click', async () => {
+    saveSearchOpts();
+    try {
+      await ensureSearchRoot(); // 目录与权限先确认，免得采完才发现写不了
+      const tabId = await activeTabId();
+      if (!tabId) throw new Error('没有活动标签页');
+      const res = await sendToTab(tabId, {
+        type: 'searchCaptureStart',
+        rounds: parseInt($('search-rounds').value, 10),
+        intervalMs: parseInt($('search-interval').value, 10),
+      });
+      if (!res.ok) throw new Error(res.error || '启动失败');
+      const root = await getRootHandle();
+      await drainAndShow(root);
+    } catch (e) {
+      $('search-status').textContent = '启动失败：' + String(e && e.message || e);
+    }
+  });
+
+  $('search-stop').addEventListener('click', async () => {
+    try {
+      const tabId = await activeTabId();
+      if (tabId) await sendToTab(tabId, { type: 'searchCaptureStop' });
+      const root = await getRootHandle();
+      await drainAndShow(root);
+    } catch (e) {
+      $('search-status').textContent = '停止失败：' + String(e && e.message || e);
+    }
+  });
+
+  // 打开就补救一次，之后每秒跟一次：弹窗关着的时候采集照跑，重开继续写
+  try {
+    const root0 = await getRootHandle();
+    if (root0) await drainAndShow(root0);
+    else {
+      const st = await searchStatusLine();
+      $('search-status').textContent = st.text;
+    }
+  } catch (e) { /* 忽略 */ }
+  setInterval(async () => {
+    try {
+      const root = await getRootHandle();
+      if (root) await drainAndShow(root);
+    } catch (e) { /* 忽略 */ }
+  }, 1000);
+
   $('open-manage').addEventListener('click', () => {
     chrome.runtime.openOptionsPage();
   });

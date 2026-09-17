@@ -60,6 +60,328 @@
   // 检索页关键词提示的有效期：超过则不回填，避免把上一次检索错记到新笔记上
   const KEYWORD_HINT_TTL_MS = 30 * 60 * 1000;
 
+  // ---------- 搜索结果页粗糙采集（见 docs/DESIGN-search-hits.md） ----------
+  // 这个格式有自己的版本号：它与 metadata.json 是两套文件，不该互相牵动
+  const SEARCH_SCHEMA_VERSION = 1;
+  const SEARCH_DIR = 'searches';
+  const SEARCH_SELECTION_SUFFIX = '.selection.json';
+  const SEARCH_DEFAULT_ROUNDS = 5;
+  const SEARCH_DEFAULT_INTERVAL_MS = 2000;
+  // 低于这个间隔不会更快拿到数据（懒加载本身要时间），只会更像自动化
+  const SEARCH_MIN_INTERVAL_MS = 1000;
+  const SEARCH_MAX_ROUNDS = 200; // 仅防误填，不是产品上限；真要更多可改
+
+  // 筛选枚举：实测自 search/filter 响应的 data.filters（见设计文档「Phase 0 取证结论」）。
+  // 请求体里的 note_type 是数字、枚举表的 id 是字符串，完整对应关系未证实，
+  // 所以标签只做展示，文件名与数据一律用 raw 值。
+  const FILTER_GROUP_LABELS = {
+    sort_type: '排序依据',
+    filter_note_type: '笔记类型',
+    filter_note_time: '发布时间',
+    filter_note_range: '搜索范围',
+    filter_pos_distance: '位置距离',
+    filter_hot: '热门词',
+  };
+
+  function filterTagLabel(group, tag) {
+    if (group === 'sort_type') {
+      const hit = SORT_ORDER_OPTIONS.find((o) => o.value === tag);
+      if (hit) return hit.label;
+    }
+    return String(tag);
+  }
+
+  // filters 数组 → 人读标签，例如「排序依据 最新 · 笔记类型 不限」
+  function filterLabelOf(filters) {
+    if (!Array.isArray(filters) || !filters.length) return '';
+    const parts = [];
+    for (const f of filters) {
+      if (!f || !f.type) continue;
+      const tags = Array.isArray(f.tags) ? f.tags : [];
+      if (!tags.length) continue;
+      const group = FILTER_GROUP_LABELS[f.type] || f.type;
+      parts.push(group + ' ' + tags.map((t) => filterTagLabel(f.type, t)).join('/'));
+    }
+    return parts.join(' · ');
+  }
+
+  // 文件名用的片段：去掉路径非法字符，限长。取不到就返回空串，让调用方决定回退值
+  function sanitizeFilePart(s, max) {
+    return String(s == null ? '' : s)
+      .replace(/[\\/:*?"<>|\r\n\t]+/g, '_')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, max || 60);
+  }
+
+  // 批次文件名（不含扩展名）：检索词_YYYYMMDD-HHmm_排序方式
+  function searchFileName(keyword, at, sortValue) {
+    const d = (at instanceof Date) ? at : new Date(at || Date.now());
+    const pad = (n) => String(n).padStart(2, '0');
+    const stamp = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes());
+    const kw = sanitizeFilePart(keyword) || '未识别';
+    const sort = sanitizeFilePart(sortValue) || 'general';
+    return kw + '_' + stamp + '_' + sort;
+  }
+
+  function httpsUrl(v) {
+    const s = String(v == null ? '' : v).trim();
+    if (!s) return '';
+    return s.replace(/^http:\/\//i, 'https://');
+  }
+
+  // 卡片上的发布时间：三种实测形态
+  //   "06-23"        今年内，只有月-日
+  //   "2025-06-18"   跨年，完整日期
+  //   "4天前" "6小时前"  近期相对时间 —— 无法还原，只能存原文
+  // 缺年份时按观测年份补；补出来的日期若落在未来（跨年），退回上一年。
+  // 取当地正午，避免时区换算把日期推到前一天。
+  function parseCardDate(text, observedAt) {
+    if (!text) return null;
+    const t = String(text).trim();
+    let y = 0, mo = 0, d = 0;
+    const full = t.match(/(\d{4})[-/年](\d{1,2})[-/月](\d{1,2})/);
+    if (full) {
+      y = Number(full[1]); mo = Number(full[2]); d = Number(full[3]);
+    } else {
+      const md = t.match(/^(\d{1,2})[-/月](\d{1,2})/);
+      if (!md) return null;
+      mo = Number(md[1]); d = Number(md[2]);
+      const obs = observedAt ? new Date(observedAt) : new Date();
+      y = obs.getFullYear();
+      const guess = new Date(y, mo - 1, d, 12, 0, 0);
+      if (guess.getTime() - obs.getTime() > 24 * 3600 * 1000) y -= 1;
+    }
+    if (!y || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+    const dt = new Date(y, mo - 1, d, 12, 0, 0);
+    return isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // 日期只到"日"：卡片上给的本来就是日（"06-23"），写成带时分秒的时间戳是假精度。
+  // 用鸭子类型判断，避免跨 realm 的 instanceof 失效（自检沙箱里会踩到）。
+  function dayString(d) {
+    if (!d || typeof d.getTime !== 'function' || isNaN(d.getTime())) return null;
+    const pad = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+  }
+
+  // 平台显示日期用的是北京时间。固定 +8 取日，不跟浏览器时区走——
+  // 换时区或挂代理不该让同一条记录的日期变一天。
+  function dayStringCST(d) {
+    if (!d || typeof d.getTime !== 'function' || isNaN(d.getTime())) return null;
+    return new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+  }
+
+  function dayDiffDays(a, b) {
+    const pa = Date.parse(a + 'T00:00:00Z');
+    const pb = Date.parse(b + 'T00:00:00Z');
+    if (!Number.isFinite(pa) || !Number.isFinite(pb)) return null;
+    return Math.round((pa - pb) / 86400000);
+  }
+
+  // 笔记 id 是 24 位十六进制（MongoDB ObjectID 形态），**前 4 字节是生成时刻的 Unix 秒**。
+  // 机制见 MongoDB ObjectID 规范（前 4 字节时间戳）；小红书侧的独立实现可参考
+  // OpenCLI 的 noteIdToDate()（PR #485）：同样取前 8 位十六进制、同样按 UTC+8 出日期。
+  //
+  // ⚠ 这不是官方字段。平台没有承诺"id 生成时刻"永远等于"发布时间"，
+  // 所以调用方必须拿它和卡片上的文字交叉校验（见 buildSearchHit 的 publishDateConflict）。
+  function noteIdTimestamp(noteId) {
+    const id = String(noteId == null ? '' : noteId).trim();
+    if (!/^[0-9a-f]{24}$/i.test(id)) return null;
+    const sec = parseInt(id.slice(0, 8), 16);
+    // 合理区间兜底：约 2001-09 ～ 2096-10。超出即视为解不出，宁可不给日期。
+    if (!Number.isFinite(sec) || sec < 1000000000 || sec > 4000000000) return null;
+    const d = new Date(sec * 1000);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // 命中条目的类型：平台用 model_type 自报，认它；没有这个字段时才看形状
+  function searchItemKindOf(item) {
+    if (!item || typeof item !== 'object') return 'other';
+    const mt = item.model_type || item.modelType;
+    if (mt) return String(mt);
+    return (item.note_card || item.noteCard) ? 'note' : 'other';
+  }
+
+  function cardOf(item) {
+    return (item && (item.note_card || item.noteCard)) || null;
+  }
+
+  // 从 image_list[].info_list[] 取默认图（WB_DFT），拿不到就用第一张
+  function defaultImageUrl(entry) {
+    const infos = (entry && (entry.info_list || entry.infoList)) || [];
+    if (!Array.isArray(infos)) return '';
+    const def = infos.find((i) => i && i.image_scene === 'WB_DFT') || infos[0];
+    return httpsUrl(def && def.url);
+  }
+
+  function hitImages(card) {
+    const list = (card && (card.image_list || card.imageList)) || [];
+    if (!Array.isArray(list)) return [];
+    return list.map(defaultImageUrl).filter(Boolean);
+  }
+
+  // 一条命中记录。计数只取四个 *_count：
+  // interact_info 里的 liked / collected 是"当前登录账号有没有赞过、藏过"，
+  // 属于浏览者状态而不是笔记属性，必须在唯一的产出口就丢掉。
+  function buildSearchHit(item, ctx) {
+    const c = ctx || {};
+    const kind = searchItemKindOf(item);
+    const card = cardOf(item);
+    const noteId = (item && (item.id || item.noteId || item.note_id)) || '';
+    const base = {
+      _type: 'hit',
+      seq: c.seq,
+      rank: c.rank,
+      rankAmongNotes: kind === 'note' ? c.rankAmongNotes : null,
+      page: c.page,
+      indexInPage: c.indexInPage,
+      seenAtRound: c.seenAtRound == null ? null : c.seenAtRound,
+      itemKind: kind,
+      noteId: kind === 'note' ? noteId : '',
+      capturedAt: c.capturedAt || new Date().toISOString(),
+    };
+
+    if (kind !== 'note' || !card) {
+      // 非笔记条目（实测只有 hot_query）：保留题名与推荐词，位次照占
+      const hq = (item && (item.hot_query || item.hotQuery)) || {};
+      base.title = String(hq.title || (item && item.title) || '');
+      const queries = Array.isArray(hq.queries) ? hq.queries : [];
+      base.queries = queries.map((q) => ({
+        name: (q && (q.name || q.search_word)) || '',
+        searchWord: (q && q.search_word) || '',
+      })).filter((q) => q.name || q.searchWord);
+      return base;
+    }
+
+    const info = card.interact_info || card.interactInfo || {};
+    const counts = {
+      likeCount: info.liked_count != null ? info.liked_count : info.likedCount,
+      collectCount: info.collected_count != null ? info.collected_count : info.collectedCount,
+      commentCount: info.comment_count != null ? info.comment_count : info.commentCount,
+      shareCount: info.shared_count != null ? info.shared_count : info.sharedCount,
+    };
+    const raw = {};
+    const values = {};
+    for (const k of ['likeCount', 'collectCount', 'commentCount', 'shareCount']) {
+      const v = counts[k];
+      raw[k] = (v == null || v === '') ? null : String(v);
+      values[k] = parseCount(raw[k]);
+    }
+
+    const tags = card.corner_tag_info || card.cornerTagInfo || [];
+    const timeTag = Array.isArray(tags) ? tags.find((t) => t && t.type === 'publish_time') : null;
+    const timeRaw = (timeTag && timeTag.text) || '';
+    // 锚点是"响应到达的那一刻"，不是写盘时刻：一次采集可能跨午夜，
+    // 用写盘时间做基准会把相对时间整体挪一天。
+    const observedAt = c.observedAt || base.capturedAt;
+    // 两条时间来源：卡片文字（只到日，可能是"6天前"这种相对说法）与笔记 id（精确到秒）。
+    const hasFullYear = /(\d{4})[-/年]/.test(timeRaw);
+    const cardDay = dayStringCST(parseCardDate(timeRaw, observedAt));
+    const idDate = noteIdTimestamp(noteId);
+    const idDay = dayStringCST(idDate);
+    // 交叉校验：两边都给得出日期时比一比，差超过一天就标记出来。
+    // 不静默采用任何一边——id 的格式非官方，哪天变了必须看得见。
+    const diff = (idDay && cardDay) ? dayDiffDays(idDay, cardDay) : null;
+    const conflict = diff != null && Math.abs(diff) > 1;
+    const images = hitImages(card);
+    const cover = card.cover || {};
+    const user = card.user || {};
+
+    return Object.assign(base, {
+      title: String(card.display_title || card.displayTitle || '').trim(),
+      author: {
+        userId: user.user_id || user.userId || '',
+        nickname: user.nickname || user.nick_name || '',
+        avatar: httpsUrl(user.avatar),
+      },
+      stats: values,
+      statsRaw: raw,
+      // 主值优先取 id 解出的时间（精确到秒）；id 解不出时才回落到卡片文字（只到日）
+      publishTimestamp: idDate ? idDate.toISOString() : null,
+      publishDate: idDay || cardDay,
+      publishDateCard: cardDay,
+      publishDateSource: idDay
+        ? 'note_id'
+        : (cardDay ? (hasFullYear ? 'card_full_date' : 'card_month_day_year_inferred')
+          : (timeRaw ? 'relative_unresolved' : 'missing')),
+      publishDateConflict: conflict,
+      publishDateDiffDays: diff,
+      publishTimeRaw: timeRaw || null,
+      publishTimeObservedAt: observedAt,
+      noteType: card.type || '',
+      hitImageCount: images.length,
+      coverUrl: httpsUrl(cover.url_default || cover.urlDefault) || images[0] || '',
+      coverFile: null,
+      images: images,
+      url: noteId
+        ? 'https://www.xiaohongshu.com/search_result/' + noteId
+          + (item.xsec_token ? '?xsec_token=' + encodeURIComponent(item.xsec_token) : '')
+        : '',
+      xsecToken: item.xsec_token || '',
+    });
+  }
+
+  // 去重：同一篇笔记可能被分页重复给出。保留首次出现的位次，
+  // 后续出现只登记进 duplicates（"它出现了两次"本身是信息，但不该改动已定型的记录）。
+  function mergeSearchHit(seen, hit) {
+    const id = hit && hit.noteId;
+    if (!id) return { status: 'added', hit: hit };
+    const old = seen[id];
+    if (!old) { seen[id] = hit; return { status: 'added', hit: hit }; }
+    return { status: 'repeat', hit: old };
+  }
+
+  // 勾选清单导出的列。批次属性（sessionId/keyword/searchId/filtersLabel）必须带上，
+  // 否则导出的清单无法回溯"从哪一批、哪个检索词里挑的"。
+  // ⚠ 这份清单与 searchHitRow() 的键必须一一对应，selftest 有断言。
+  const SEARCH_HIT_COLUMNS = [
+    'sessionId', 'keyword', 'searchId', 'filtersLabel',
+    'seq', 'rank', 'rankAmongNotes', 'page', 'indexInPage', 'itemKind', 'noteId', 'title',
+    'authorNickname', 'authorUserId', 'noteType', 'hitImageCount',
+    'likeCount', 'collectCount', 'commentCount', 'shareCount',
+    'publishTimestamp', 'publishDate', 'publishDateCard', 'publishDateSource',
+    'publishDateConflict', 'publishTimeRaw', 'publishTimeObservedAt',
+    'coverFile', 'url', 'capturedAt',
+  ];
+
+  function searchHitRow(hit, session) {
+    const h = hit || {};
+    const s = session || {};
+    return {
+      seq: h.seq, rank: h.rank, rankAmongNotes: h.rankAmongNotes,
+      page: h.page, indexInPage: h.indexInPage, itemKind: h.itemKind,
+      noteId: h.noteId || '', title: h.title || '',
+      authorNickname: (h.author && h.author.nickname) || '',
+      authorUserId: (h.author && h.author.userId) || '',
+      noteType: h.noteType || '',
+      hitImageCount: h.hitImageCount == null ? '' : h.hitImageCount,
+      likeCount: fmtNum(h.stats, 'likeCount'), collectCount: fmtNum(h.stats, 'collectCount'),
+      commentCount: fmtNum(h.stats, 'commentCount'), shareCount: fmtNum(h.stats, 'shareCount'),
+      publishTimestamp: h.publishTimestamp || '',
+      publishDate: h.publishDate || '',
+      publishDateCard: h.publishDateCard || '',
+      publishDateSource: h.publishDateSource || '',
+      publishDateConflict: h.publishDateConflict ? 1 : 0,   // CSV 里用 1/0，jsonl 里是布尔
+      publishTimeRaw: h.publishTimeRaw || '',
+      publishTimeObservedAt: h.publishTimeObservedAt || '',
+      coverFile: h.coverFile || '', url: h.url || '', capturedAt: h.capturedAt || '',
+      // 批次属性：导出时必须带上，否则选出的清单无法回溯"从哪一批、哪个词里挑的"
+      keyword: s.keyword || '', searchId: s.searchId || '',
+      filtersLabel: s.filtersLabel || '', sessionId: s.sessionId || '',
+    };
+  }
+
+  function fmtNum(obj, key) {
+    const v = obj && obj[key];
+    return v == null ? '' : v;
+  }
+
+  function toJsonl(rows) {
+    const list = Array.isArray(rows) ? rows : [rows];
+    return list.filter(Boolean).map((r) => JSON.stringify(r)).join('\n') + '\n';
+  }
+
   const DEFAULT_LABELS = ['重点样本', '对照组', '疑似广告', '内容质量低', '待复核'];
 
   // schema v2 下"必然缺失"的字段：不是抓取失败，而是设计上不采集或平台不给。
@@ -456,5 +778,28 @@
     effectiveKeyword,
     csvCell,
     toCsv,
+    // 搜索结果页粗糙采集
+    SEARCH_SCHEMA_VERSION,
+    SEARCH_DIR,
+    SEARCH_SELECTION_SUFFIX,
+    SEARCH_DEFAULT_ROUNDS,
+    SEARCH_DEFAULT_INTERVAL_MS,
+    SEARCH_MIN_INTERVAL_MS,
+    SEARCH_MAX_ROUNDS,
+    FILTER_GROUP_LABELS,
+    SEARCH_HIT_COLUMNS,
+    filterLabelOf,
+    sanitizeFilePart,
+    searchFileName,
+    httpsUrl,
+    parseCardDate,
+    dayString,
+    dayStringCST,
+    noteIdTimestamp,
+    searchItemKindOf,
+    buildSearchHit,
+    mergeSearchHit,
+    searchHitRow,
+    toJsonl,
   };
 })(typeof window !== 'undefined' ? window : self);

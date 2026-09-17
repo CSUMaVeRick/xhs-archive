@@ -16,6 +16,7 @@
   <div id="tabs" class="tabs">
     <button id="tab-notes" class="tab active">笔记 <span id="count-notes" class="tab-num"></span></button>
     <button id="tab-authors" class="tab">作者 <span id="count-authors" class="tab-num"></span></button>
+    <button id="tab-batches" class="tab">检索批次 <span id="count-batches" class="tab-num"></span></button>
   </div>
 
   <!-- ================= 笔记视图 ================= -->
@@ -72,6 +73,33 @@
     </div>
     <div id="author-list" class="author-list"></div>
     <div id="author-empty" class="empty" style="display:none">还没有作者记录 —— 在笔记页点面板的「保存作者」即可</div>
+  </div>
+
+  <!-- ================= 检索批次视图 ================= -->
+  <div id="batches-view" hidden>
+    <div class="toolbar">
+      <button id="batch-reload" class="btn-mini">重新读取</button>
+      <span id="count-batch" class="count"></span>
+      <span id="batch-status" class="count"></span>
+    </div>
+
+    <div id="batch-list" class="batch-list"></div>
+    <div id="batch-empty" class="empty" style="display:none">还没有检索批次 —— 在搜索结果页用弹窗的「开始采集」采一批，文件会落在归档目录的 searches 里</div>
+
+    <div id="batch-detail" hidden>
+      <div class="toolbar">
+        <button id="batch-back" class="btn-mini">← 返回批次列表</button>
+        <span id="batch-detail-title" class="count"></span>
+        <span class="sep"></span>
+        <button id="batch-select-all" class="btn-mini">全选</button>
+        <button id="batch-select-none" class="btn-mini">全不选</button>
+        <span id="batch-sel-count" class="count">已勾选 0 篇</span>
+        <span class="sep"></span>
+        <button id="batch-export-jsonl" class="btn-mini">导出勾选 JSONL</button>
+        <button id="batch-export-csv" class="btn-mini">导出勾选 CSV</button>
+      </div>
+      <div id="batch-cards" class="batch-cards"></div>
+    </div>
   </div>
 
   <!-- 预览 / 标注抽屉 -->

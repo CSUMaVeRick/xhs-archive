@@ -68,6 +68,19 @@ header {
 }
 .input:focus { outline: none; border-color: #ff2442; }
 
+/* 两个并排的小输入框（滚动次数 / 间隔） */
+.row { display: flex; gap: 6px; }
+.row .input { margin-bottom: 6px; }
+
+/* 诊断文本框：等宽 + 可纵向拉，手动全选复制时好看清结构 */
+textarea.input {
+  font-family: ui-monospace, Consolas, "Courier New", monospace;
+  font-size: 11px;
+  line-height: 1.4;
+  resize: vertical;
+  min-height: 52px;
+}
+
 .dir-status { font-size: 11px; color: #999; word-break: break-all; white-space: pre-wrap; }
 
 .status {

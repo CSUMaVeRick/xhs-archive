@@ -13,6 +13,8 @@
  *  ⑦ schema 纯函数单测（parseCount / toCsv / effectiveKeyword）
  *  ⑧ 在 vm 沙箱里用假 DOM 跑通 extract() 的 DOM 与 __INITIAL_STATE__ 两条路径，
  *     校验时间来源、标签清洗、统计数空值语义、错标闸门
+ *  ⑨ 检索结果通道与粗糙采集的数据契约：字段路径摘要、请求 body 捕获、隐私闸门、
+ *     以及"检索命中不进笔记缓存"这条架构约束
  *
  * 改动 content/extract.js、content/schema.js、manage.js 之后请跑一遍。
  */
@@ -21,10 +23,17 @@ const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
 
+// 同步 thenable：让 hook 里的 p.then / clone().json().then 在当前栈内跑完，
+// 免得为了测 hook 把整个自检改成异步
+function syncThen(v) {
+  return { then: (fn) => syncThen(fn(v)), catch: () => syncThen(null) };
+}
+
 const root = path.join(__dirname, '..');
 const jsFiles = [
-  'content/schema.js', 'content/network.js', 'content/card.js', 'content/extract.js',
-  'content/archive.js', 'content/main.js', 'popup.js', 'manage.js', 'background.js',
+  'content/schema.js', 'content/network.js', 'content/card.js',
+  'content/extract.js', 'content/search.js', 'content/archive.js', 'content/main.js',
+  'popup.js', 'manage.js', 'background.js',
 ];
 
 let bad = 0;
@@ -133,6 +142,103 @@ eq('parseCount 空串', SCHEMA.parseCount(''), null);
 eq('csv 转义', SCHEMA.toCsv(['a'], [{ a: 'x,"y"\nz' }]).split('\r\n')[1], '"x,""y"" z"');
 eq('effectiveKeyword 人工优先', SCHEMA.effectiveKeyword({ _search: { keyword: 'auto词' } }, { keywords: ['人工词'] }).source, 'manual');
 eq('effectiveKeyword 回落自动', SCHEMA.effectiveKeyword({ _search: { keyword: 'auto词' } }, null).keywords, ['auto词']);
+
+// ---------- 搜索结果页粗糙采集：契约纯函数 ----------
+// 位次、去重、字段取舍都在这里定型，所以这些断言就是数据契约本身
+const at1617 = new Date(2026, 8, 17, 16, 17).getTime();
+eq('批次文件名', SCHEMA.searchFileName('新传论文发表', at1617, 'general'), '新传论文发表_20260917-1617_general');
+eq('批次文件名 去掉路径非法字符', SCHEMA.searchFileName('a/b:c*d', at1617, 'general'), 'a_b_c_d_20260917-1617_general');
+eq('批次文件名 缺检索词时不留空段', SCHEMA.searchFileName('', at1617, ''), '未识别_20260917-1617_general');
+eq('筛选标签', SCHEMA.filterLabelOf([{ type: 'sort_type', tags: ['time_descending'] }, { type: 'filter_note_type', tags: ['不限'] }]), '排序依据 最新 · 笔记类型 不限');
+eq('筛选标签 空输入', SCHEMA.filterLabelOf(null), '');
+eq('卡片日期 今年内月-日', SCHEMA.parseCardDate('06-23', '2026-09-17T08:17:00.000Z').toISOString().slice(0, 10), '2026-06-23');
+eq('卡片日期 完整日期', SCHEMA.parseCardDate('2025-06-18', '2026-09-17T08:17:00.000Z').toISOString().slice(0, 10), '2025-06-18');
+eq('卡片日期 相对时间不猜', SCHEMA.parseCardDate('4天前', '2026-09-17T08:17:00.000Z'), null);
+eq('卡片日期 跨年补年份退回上一年', SCHEMA.parseCardDate('12-18', '2026-01-05T08:00:00.000Z').toISOString().slice(0, 10), '2025-12-18');
+eq('https 归一', SCHEMA.httpsUrl('http://sns-webpic-qc.xhscdn.com/a.jpg'), 'https://sns-webpic-qc.xhscdn.com/a.jpg');
+
+const reducedNote = {
+  id: '6a39f801000000002100ac4c', model_type: 'note', xsec_token: 'AB2wAYeR=',
+  note_card: {
+    display_title: '今天当心软的审稿人', type: 'normal',
+    user: { user_id: 'u1', nickname: '新传语料库', avatar: 'http://a/av.jpg' },
+    interact_info: { liked_count: '1.2万', collected_count: '3', comment_count: '2', shared_count: '2' },
+    cover: { url_default: 'http://sns-webpic-qc.xhscdn.com/c.jpg' },
+    image_list: [
+      { info_list: [{ image_scene: 'WB_DFT', url: 'http://sns-webpic-qc.xhscdn.com/1.jpg' }, { image_scene: 'WB_PRV', url: 'http://sns-webpic-qc.xhscdn.com/1p.jpg' }] },
+      { info_list: [{ image_scene: 'WB_DFT', url: 'http://sns-webpic-qc.xhscdn.com/2.jpg' }] },
+    ],
+    corner_tag_info: [{ type: 'publish_time', text: '06-23' }],
+  },
+};
+const hitNote = SCHEMA.buildSearchHit(reducedNote, { seq: 7, rank: 7, rankAmongNotes: 6, page: 1, indexInPage: 7, seenAtRound: 1, capturedAt: '2026-09-17T08:17:02.000Z', observedAt: '2026-09-17T08:17:00.000Z' });
+eq('命中 类型', hitNote.itemKind, 'note');
+eq('命中 位次与页码', [hitNote.rank, hitNote.rankAmongNotes, hitNote.page, hitNote.indexInPage, hitNote.seenAtRound], [7, 6, 1, 7, 1]);
+eq('命中 计数解析（1.2万）', hitNote.stats.likeCount, 12000);
+eq('命中 计数原始串保留', hitNote.statsRaw.likeCount, '1.2万');
+eq('命中 浏览量字段不透出', Object.keys(hitNote).filter((k) => k === 'liked' || k === 'collected'), []);
+// 时间只到"日"：卡片上没有时分秒，就不编一个出来
+// 时间：笔记 id 前 8 位十六进制是生成时刻（Unix 秒），精确到秒；
+// 卡片文字只到日，用来跟 id 交叉校验（id 的格式非官方，对不上必须看得见）
+eq('命中 发布时刻来自笔记 id', hitNote.publishTimestamp, '2026-06-23T03:05:37.000Z');
+eq('命中 发布日按东八区取', hitNote.publishDate, '2026-06-23');
+eq('命中 时间来源标为 note_id', hitNote.publishDateSource, 'note_id');
+eq('命中 卡片文字给出的日另存一列', hitNote.publishDateCard, '2026-06-23');
+eq('命中 id 与卡片一致时不报冲突', hitNote.publishDateConflict, false);
+eq('命中 发布时间原文', hitNote.publishTimeRaw, '06-23');
+eq('命中 观测锚点用响应到达时刻', hitNote.publishTimeObservedAt, '2026-09-17T08:17:00.000Z');
+eq('命中 图集取默认图并转 https', hitNote.images, ['https://sns-webpic-qc.xhscdn.com/1.jpg', 'https://sns-webpic-qc.xhscdn.com/2.jpg']);
+eq('命中 图集数量与笔记总图数不是一回事', hitNote.hitImageCount, 2);
+eq('命中 封面', hitNote.coverUrl, 'https://sns-webpic-qc.xhscdn.com/c.jpg');
+eq('命中 链接带 xsec_token', hitNote.url, 'https://www.xiaohongshu.com/search_result/6a39f801000000002100ac4c?xsec_token=AB2wAYeR%3D');
+eq('命中 封面未下载时为 null', hitNote.coverFile, null);
+
+// id 解码器本身：含 OpenCLI PR #485 公布的三个测试向量（独立实现，用来互相校验）
+eq('id 时间戳 1', SCHEMA.dayStringCST(SCHEMA.noteIdTimestamp('697f6c74000000002103de17')), '2026-02-01');
+eq('id 时间戳 2', SCHEMA.dayStringCST(SCHEMA.noteIdTimestamp('68e90be80000000004022e66')), '2025-10-10');
+eq('id 时间戳 跨日按东八区', SCHEMA.dayStringCST(SCHEMA.noteIdTimestamp('69b739f00000000000000000')), '2026-03-16');
+eq('id 时间戳 我们夹具那条（卡片写的 06-23）', SCHEMA.dayStringCST(SCHEMA.noteIdTimestamp('6a39f801000000002100ac4c')), '2026-06-23');
+eq('id 不是 24 位十六进制时不猜', SCHEMA.noteIdTimestamp('abcdef'), null);
+eq('id 里出现非十六进制字符时不猜（格式变了）', SCHEMA.noteIdTimestamp('zz39f801000000002100ac4c'), null);
+eq('id 全零（时间戳越界）时不给日期', SCHEMA.noteIdTimestamp('000000000000000000000000'), null);
+eq('id 时间戳超出合理区间时不给日期', SCHEMA.noteIdTimestamp('ffffffff0000000000000000'), null);
+eq('id 解不出时回落到卡片文字', SCHEMA.buildSearchHit(Object.assign({}, reducedNote, {
+  id: 'zz39f801000000002100ac4c',
+  note_card: Object.assign({}, reducedNote.note_card, { corner_tag_info: [{ type: 'publish_time', text: '2025-06-18' }] }),
+}), { seq: 1, rank: 1, rankAmongNotes: 1 }).publishDateSource, 'card_full_date');
+
+// 完整日期：与 id 解出的日期打架时，两边都留着并打标记
+const hitFullDate = SCHEMA.buildSearchHit(Object.assign({}, reducedNote, {
+  note_card: Object.assign({}, reducedNote.note_card, { corner_tag_info: [{ type: 'publish_time', text: '2025-06-18' }] }),
+}), { seq: 1, rank: 1, rankAmongNotes: 1 });
+eq('命中 冲突时两个日期都留', [hitFullDate.publishDate, hitFullDate.publishDateCard], ['2026-06-23', '2025-06-18']);
+eq('命中 冲突被标记出来', [hitFullDate.publishDateConflict, hitFullDate.publishDateDiffDays], [true, 370]);
+// 相对时间：有了 id 就不需要"换算"，直接读 id；原文与锚点仍保留供审计
+const hitRelative = SCHEMA.buildSearchHit(Object.assign({}, reducedNote, {
+  note_card: Object.assign({}, reducedNote.note_card, { corner_tag_info: [{ type: 'publish_time', text: '4天前' }] }),
+}), { seq: 2, rank: 2, rankAmongNotes: 2, capturedAt: '2026-09-17T08:17:02.000Z', observedAt: '2026-09-17T08:17:00.000Z' });
+eq('命中 相对时间由 id 直接解出', [hitRelative.publishDate, hitRelative.publishDateSource], ['2026-06-23', 'note_id']);
+eq('命中 相对时间没有卡片日可对，不算冲突', [hitRelative.publishDateCard, hitRelative.publishDateConflict], [null, false]);
+eq('命中 相对时间留住原文与锚点', [hitRelative.publishTimeRaw, hitRelative.publishTimeObservedAt], ['4天前', '2026-09-17T08:17:00.000Z']);
+eq('dayString 只到日（本地时区）', SCHEMA.dayString(new Date(2026, 5, 23, 12, 34, 56)), '2026-06-23');
+eq('dayStringCST 固定东八区', SCHEMA.dayStringCST(new Date(Date.UTC(2026, 2, 15, 23, 0, 0))), '2026-03-16');
+
+const hitQuery = SCHEMA.buildSearchHit({ id: 'q1#1', model_type: 'hot_query', hot_query: { title: '大家都在搜', queries: [{ name: '露营', search_word: '露营' }] } }, { seq: 7, rank: 7, rankAmongNotes: 7, page: 1, indexInPage: 7 });
+eq('热词条目 类型', hitQuery.itemKind, 'hot_query');
+eq('热词条目 不占笔记位次', hitQuery.rankAmongNotes, null);
+eq('热词条目 不当成笔记 id', hitQuery.noteId, '');
+eq('热词条目 保留题名与推荐词', [hitQuery.title, hitQuery.queries.length], ['大家都在搜', 1]);
+
+const seenMap = {};
+eq('去重 首次收录', SCHEMA.mergeSearchHit(seenMap, hitNote).status, 'added');
+eq('去重 第二次判为重复', SCHEMA.mergeSearchHit(seenMap, SCHEMA.buildSearchHit(reducedNote, { seq: 30, rank: 30 })).status, 'repeat');
+eq('去重 保留首次那条', SCHEMA.mergeSearchHit(seenMap, SCHEMA.buildSearchHit(reducedNote, { seq: 31, rank: 31 })).hit.rank, 7);
+eq('去重 非笔记条目不参与 noteId 去重', SCHEMA.mergeSearchHit(seenMap, hitQuery).status, 'added');
+
+const hitExportRow = SCHEMA.searchHitRow(hitNote, { sessionId: 's1', keyword: '露营', searchId: 'sid1', filtersLabel: '排序依据 综合' });
+eq('导出列与数据行一一对应', Object.keys(hitExportRow).sort(), SCHEMA.SEARCH_HIT_COLUMNS.slice().sort());
+eq('导出列带上批次属性', [hitExportRow.sessionId, hitExportRow.keyword, hitExportRow.searchId], ['s1', '露营', 'sid1']);
+eq('jsonl 一行一条', SCHEMA.toJsonl([{ a: 1 }, { a: 2 }]).split('\n').filter(Boolean).length, 2);
 
 // ---------- extract.js 端到端冒烟（DOM 回退路径） ----------
 function fakeEl(text, extra) {
@@ -510,8 +616,16 @@ function buildNetEnv(opts) {
     clearTimeout: () => {},
     XMLHttpRequest: function () {},
   };
-  sandbox.XMLHttpRequest.prototype = { open() {}, send() {} };
+  sandbox.XMLHttpRequest.prototype = {
+    open() {},
+    send() {},
+    addEventListener(type, fn) {
+      const l = this.__listeners || (this.__listeners = {});
+      (l[type] = l[type] || []).push(fn);
+    },
+  };
   sandbox.window = sandbox;
+  if (opts.fetch) sandbox.fetch = opts.fetch;
   if (opts.state) sandbox.__INITIAL_STATE__ = opts.state;
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(path.join(root, 'content/network.js'), 'utf8'), sandbox, { filename: 'network.js' });
@@ -573,6 +687,76 @@ for (let i = 0; i < 120; i++) netSkip.sandbox.__XHS_INGEST__(noteLike, '//edith.
 const urls = JSON.parse(netSkip.els['xhs-note-api-urls'].textContent);
 eq('URL 列表有上限', urls.length <= 60, true);
 eq('URL 列表无重复', urls.length, new Set(urls).size);
+
+// ---------- 非笔记条目：平台自报的 model_type 就是判据 ----------
+// 热词/推荐词条目：实测形状是标题嵌在 hot_query 里，本来就不满足 looksLikeNote。
+// 下面这条用"外层带 title"的假想形状验证 isNonNoteItem 这道防御——平台只要把 model_type
+// 标成非 note，就不该被当成笔记收进候选池。
+const netQuery = buildNetEnv({ noteId: 'n1' });
+netQuery.sandbox.__XHS_INGEST__({ id: 'q1', model_type: 'hot_query', title: '露营' }, '//edith.xiaohongshu.com/api/sns/web/v1/search/notes?keyword=x');
+eq('非 note 的 model_type 一律不收（防御）', Object.keys(netQuery.sandbox.__XHS_NOTE_API__ || {}).length, 0);
+netQuery.sandbox.__XHS_INGEST__({ id: 'n9', model_type: 'note', title: '真笔记' }, '//edith.xiaohongshu.com/api/sns/web/v1/search/notes?keyword=x');
+eq('标为 note 的条目仍然收', Object.keys(netQuery.sandbox.__XHS_NOTE_API__ || {}).length, 1);
+
+// ---------- 检索结果通道（搜索结果页粗糙采集的数据来源） ----------
+// 与笔记缓存是两条通道：检索响应里的薄卡片既不进 MAP，也不该被当作"当前笔记"
+const searchNotesUrl = 'https://so.xiaohongshu.com/api/sns/web/v2/search/notes';
+const searchNotesPayload = {
+  code: 0, success: true,
+  data: {
+    has_more: true,
+    items: [
+      { id: 'n1', model_type: 'note', xsec_token: 'tok1', note_card: {
+        display_title: '露营装备清单', type: 'normal',
+        user: { user_id: 'u1', nickname: '甲', avatar: 'http://a/av.jpg' },
+        interact_info: { liked_count: '17', collected_count: '3', comment_count: '2', shared_count: '2', liked: true, collected: true },
+        cover: { url_default: 'http://sns-webpic-qc.xhscdn.com/c.jpg' },
+        image_list: [{ info_list: [{ image_scene: 'WB_DFT', url: 'http://a/1.jpg' }] }],
+        corner_tag_info: [{ type: 'publish_time', text: '06-23' }],
+      } },
+      { id: 'q1', model_type: 'hot_query', hot_query: { title: '大家都在搜', queries: [{ name: '露营', search_word: '露营' }] } },
+    ],
+  },
+};
+const envSearch = buildNetEnv({ noteId: 'n1' });
+const sxhrSearch = new envSearch.sandbox.XMLHttpRequest();
+sxhrSearch.open('POST', searchNotesUrl);
+sxhrSearch.send(JSON.stringify({ keyword: '露营', page: 1, page_size: 20, search_id: 'sid1', sort: 'general', note_type: 0, filters: [{ type: 'sort_type', tags: ['time_descending'] }] }));
+sxhrSearch.status = 200; sxhrSearch.responseType = ''; sxhrSearch.responseText = JSON.stringify(searchNotesPayload);
+for (const fn of (sxhrSearch.__listeners && sxhrSearch.__listeners.load) || []) fn.call(sxhrSearch);
+
+const batches = envSearch.sandbox.__XHS_SEARCH_BATCHES__();
+eq('检索通道 收到一批', batches.length, 1);
+eq('检索通道 条目数', batches[0].items.length, 2);
+eq('检索通道 记下请求参数（页码在 body 里）', [batches[0].req.page, batches[0].req.keyword, batches[0].req.searchId], [1, '露营', 'sid1']);
+eq('检索通道 筛选数组原样保留', batches[0].req.filters, [{ type: 'sort_type', tags: ['time_descending'] }]);
+eq('检索通道 浏览者状态字段在桥上就被丢掉', batches[0].items[0].note_card.interact_info, { liked_count: '17', collected_count: '3', comment_count: '2', shared_count: '2' });
+eq('检索通道 热词条目按 model_type 分类', batches[0].items[1].model_type, 'hot_query');
+eq('检索通道 检索卡片不进笔记缓存', Object.keys(envSearch.sandbox.__XHS_NOTE_API__ || {}).length, 0);
+// 内容脚本取走后写回 ack；下一次刷新时已消费的批次被丢掉
+envSearch.els['xhs-search-hits-ack'] = { id: 'xhs-search-hits-ack', style: {}, textContent: JSON.stringify({ consumed: 1 }) };
+envSearch.sandbox.__XHS_INGEST__({ id: 'x9', model_type: 'note', title: 'x' }, '//edith.xiaohongshu.com/api/sns/web/v1/feed');
+eq('检索通道 ack 后丢弃已消费批次', envSearch.sandbox.__XHS_SEARCH_BATCHES__().length, 0);
+// 隐私边界：检索历史在 SKIP 列表里，即便 URL 里有 search 也不该进检索通道
+envSearch.sandbox.__XHS_INGEST__({ data: { items: [{ id: 'x', model_type: 'note', note_card: { display_title: 'x' } }] } }, '//edith.xiaohongshu.com/api/sns/web/search/history/sync');
+eq('检索通道 不读检索历史', envSearch.sandbox.__XHS_SEARCH_BATCHES__().length, 0);
+
+// fetch 也是页面可能用的传输方式：请求体的页码与筛选参数同样要能读到
+const fetched = [];
+const envFetch = buildNetEnv({
+  noteId: 'n1',
+  fetch: (url, init) => {
+    fetched.push({ url: String(url), body: init && init.body });
+    return syncThen({
+      headers: { get: () => 'application/json' },
+      clone: () => ({ json: () => syncThen(searchNotesPayload) }),
+    });
+  },
+});
+envFetch.sandbox.fetch('https://so.xiaohongshu.com/api/sns/web/v2/search/notes', { body: JSON.stringify({ page: 2, page_size: 20, keyword: '露营' }) });
+const fetchBatches = envFetch.sandbox.__XHS_SEARCH_BATCHES__();
+eq('检索通道 fetch 路径 收到一批', fetchBatches.length, 1);
+eq('检索通道 fetch 路径 记下页码', fetchBatches[0].req.page, 2);
 
 // ---------- 评论采集（状态首屏 + 滚动时页面自己发的评论接口） ----------
 const stateWithComments = {

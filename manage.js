@@ -136,7 +136,9 @@ async function pickRoot() {
   rootHandle = h;
   $('pick-dir').textContent = '切换归档目录: ' + h.name;
   await refreshWriteMode();
+  batchesLoaded = false;   // 换了目录，批次要重新读
   await loadNotes();
+  if (activeTab === 'batches') await loadBatches();
 }
 
 async function walkDir(dir, depth, out, relPath) {
@@ -800,14 +802,266 @@ function switchTab(tab) {
   activeTab = tab;
   $('tab-notes').classList.toggle('active', tab === 'notes');
   $('tab-authors').classList.toggle('active', tab === 'authors');
+  $('tab-batches').classList.toggle('active', tab === 'batches');
   $('notes-view').hidden = tab !== 'notes';
   $('authors-view').hidden = tab !== 'authors';
+  $('batches-view').hidden = tab !== 'batches';
+  if (tab === 'batches' && !batchesLoaded) loadBatches();
 }
 
 function updateTabCounts() {
   $('count-notes').textContent = notes.length ? String(notes.length) : '';
   $('count-authors').textContent = authors.length ? String(authors.length) : '';
+  $('count-batches').textContent = batches.length ? String(batches.length) : '';
 }
+
+// ---------- 检索批次（搜索结果页粗糙采集的产物） ----------
+// 数据形状见 docs/DESIGN-search-hits.md：一个 jsonl（首行会话头 + 每行一条命中）
+// 加一个同名目录（封面）。这里的勾选状态刻意不写回 jsonl —— 原始观测不可变。
+let batches = [];            // [{ name, header, hits, selection }]
+let currentBatch = null;
+let batchesLoaded = false;
+let batchChecked = new Set();      // 当前批次里被勾选的 noteId
+let batchCoverUrls = {};           // noteId -> objectURL（离开批次时统一释放）
+
+function releaseCovers() {
+  for (const k of Object.keys(batchCoverUrls)) {
+    try { URL.revokeObjectURL(batchCoverUrls[k]); } catch (e) { /* 忽略 */ }
+  }
+  batchCoverUrls = {};
+}
+
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  const pad = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+async function loadBatches() {
+  if (!rootHandle) return;
+  releaseCovers();
+  batches = [];
+  currentBatch = null;
+  let dir = null;
+  // 只找不建：打开这个标签页不该在归档目录里留下一个空的 searches 文件夹
+  try { dir = await rootHandle.getDirectoryHandle(SCH.SEARCH_DIR); } catch (e) { dir = null; }
+  if (!dir) {
+    batchesLoaded = true;
+    renderBatchList();
+    updateTabCounts();
+    return;
+  }
+  try {
+    for await (const entry of dir.values()) {
+      if (entry.kind !== 'file' || !/\.jsonl$/.test(entry.name)) continue;
+      const name = entry.name.replace(/\.jsonl$/, '');
+      let text = '';
+      try { text = await (await entry.getFile()).text(); } catch (e) { continue; }
+      const lines = text.split('\n').filter(Boolean);
+      let header = null;
+      const hits = [];
+      for (const line of lines) {
+        let obj = null;
+        try { obj = JSON.parse(line); } catch (e) { continue; }
+        if (obj && obj._type === 'session') header = obj;
+        else if (obj) hits.push(obj);
+      }
+      let selection = null;
+      try { selection = await readJsonFile(dir, name + SCH.SEARCH_SELECTION_SUFFIX); } catch (e) { selection = null; }
+      batches.push({
+        name: name,
+        dir: dir,
+        header: header || {},
+        hits: hits,
+        selection: selection,
+        selectedCount: ((selection && selection.items) || []).length,
+      });
+    }
+  } catch (e) {
+    setBatchStatus('读取 searches 目录失败：' + ((e && e.name) || '') + ' ' + ((e && e.message) || ''), 'err');
+  }
+  batches.sort((a, b) => String((b.header && b.header.startedAt) || '').localeCompare(String((a.header && a.header.startedAt) || '')));
+  batchesLoaded = true;
+  renderBatchList();
+  updateTabCounts();
+}
+
+function setBatchStatus(msg, kind) {
+  const el = $('batch-status');
+  el.textContent = msg || '';
+  el.className = 'count' + (kind ? ' ' + kind : '');
+}
+
+function renderBatchList() {
+  $('batch-detail').hidden = true;
+  $('batch-list').hidden = false;
+  const list = $('batch-list');
+  $('batch-empty').style.display = batches.length ? 'none' : 'block';
+  $('count-batch').textContent = batches.length ? ('共 ' + batches.length + ' 批') : '';
+  list.innerHTML = batches.map((b, i) => {
+    const h = b.header || {};
+    const notes = b.hits.filter((x) => x.itemKind === 'note').length;
+    const conflicts = b.hits.filter((x) => x.publishDateConflict).length;
+    const cover = h.cover || {};
+    const coverTxt = (cover.ok || cover.fail)
+      ? ('封面 ' + (cover.ok || 0) + ' 成功' + (cover.fail ? ' / ' + cover.fail + ' 失败' : ''))
+      : '封面未记录';
+    return `<div class="batch-row" data-idx="${i}">
+      <div class="batch-row-main">
+        <div class="batch-row-title">${esc(h.keyword || '（未识别检索词）')} <span class="batch-row-file">${esc(b.name)}</span></div>
+        <div class="batch-row-meta">${esc(fmtTime(h.startedAt))} · 命中 ${b.hits.length} 条（笔记 ${notes}） · ${esc(h.filtersLabel || (h.filtersSource === 'absent' ? '未使用筛选' : '未知筛选'))} · ${esc(coverTxt)}</div>
+        <div class="batch-row-meta">${esc(h.endedAt ? ('结束 ' + fmtTime(h.endedAt)) : '（未收尾：采集可能被中断）')} · 滚 ${esc(String((h.scroll && h.scroll.done) || 0))}/${esc(String((h.scroll && h.scroll.requested) || 0))} 次${h.coverage && h.coverage.duplicateCount ? ' · 剔除重复 ' + h.coverage.duplicateCount : ''}${b.selectedCount ? ' · 已勾选 ' + b.selectedCount : ''}${conflicts ? ' · <b>日期冲突 ' + conflicts + ' 条</b>' : ''}</div>
+      </div>
+      <button class="btn-mini batch-open" data-idx="${i}">打开</button>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('.batch-open').forEach((btn) => {
+    btn.addEventListener('click', () => openBatch(Number(btn.getAttribute('data-idx'))));
+  });
+  list.querySelectorAll('.batch-row').forEach((rowEl) => {
+    rowEl.addEventListener('click', (e) => {
+      if (e.target && e.target.classList && e.target.classList.contains('batch-open')) return;
+      openBatch(Number(rowEl.getAttribute('data-idx')));
+    });
+  });
+}
+
+async function openBatch(idx) {
+  const b = batches[idx];
+  if (!b) return;
+  currentBatch = b;
+  releaseCovers();
+  batchChecked = new Set(((b.selection && b.selection.items) || []).map((x) => x.noteId).filter(Boolean));
+  $('batch-list').hidden = true;
+  $('batch-detail').hidden = false;
+  const h = b.header || {};
+  $('batch-detail-title').textContent = (h.keyword || '（未识别检索词）') + ' · ' + b.hits.length + ' 条 · ' + b.name;
+  renderBatchCards();
+  // 读封面；读不到的留占位，不假装有图
+  const dir = await b.dir.getDirectoryHandle(b.name).catch(() => null);
+  if (dir) {
+    for (const hit of b.hits) {
+      if (!hit.coverFile || !hit.noteId) continue;
+      try {
+        const fh = await dir.getFileHandle(hit.coverFile);
+        const url = URL.createObjectURL(await fh.getFile());
+        batchCoverUrls[hit.noteId] = url;
+        const img = document.querySelector('.batch-card[data-note-id="' + hit.noteId + '"] img.batch-cover');
+        if (img) img.src = url;
+      } catch (e) { /* 缺图就保持占位 */ }
+    }
+  }
+}
+
+function renderBatchCards() {
+  const b = currentBatch;
+  if (!b) return;
+  const cards = b.hits.map((hit) => {
+    const isNote = hit.itemKind === 'note';
+    const checked = batchChecked.has(hit.noteId);
+    const stats = hit.stats || {};
+    const author = (hit.author && hit.author.nickname) || '';
+    const timeTxt = hit.publishDate || hit.publishTimeRaw || '';
+    const meta = [author, timeTxt, stats.likeCount == null ? null : ('赞 ' + stats.likeCount)].filter(Boolean).join(' · ');
+    if (!isNote) {
+      return `<div class="batch-card batch-card-other" data-note-id="">
+        <div class="batch-rank">#${hit.rank}</div>
+        <div class="batch-other-body"><div class="batch-title">${esc(hit.title || '(非笔记条目)')}</div>
+        <div class="batch-meta">${esc(hit.itemKind)} · ${(hit.queries || []).length} 个推荐词</div></div>
+      </div>`;
+    }
+    return `<div class="batch-card" data-note-id="${esc(hit.noteId)}">
+      <label class="batch-check" title="勾选后可统一导出">
+        <input type="checkbox" class="batch-cb" data-note-id="${esc(hit.noteId)}"${checked ? ' checked' : ''} />
+      </label>
+      <div class="batch-rank">#${hit.rank}</div>
+      <div class="batch-cover-wrap">${hit.coverFile
+        ? `<img class="batch-cover" alt="" /><div class="batch-cover-ph" hidden>图缺失</div>`
+        : `<div class="batch-cover-ph">无封面</div>`}</div>
+      <div class="batch-title">${esc(hit.title || '(无标题)')}</div>
+      <div class="batch-meta">${esc(meta)}</div>
+      ${hit.publishDateConflict ? `<div class="batch-conflict" title="笔记 id 解出的日期与卡片上写的不一致，两边都保留在数据里">⚠ 日期冲突：卡片写 ${esc(hit.publishDateCard || '?')}</div>` : ''}
+      <div class="batch-links">${hit.url ? `<a href="${esc(hit.url)}" target="_blank" rel="noopener">原帖</a>` : ''}
+        <span class="batch-kind">${esc(hit.noteType === 'video' ? '视频' : '图文')}</span></div>
+    </div>`;
+  }).join('');
+  $('batch-cards').innerHTML = cards;
+  // 图片加载成功才把占位藏掉；文件缺失时反过来把占位显示出来，并说明是哪个问题
+  $('batch-cards').querySelectorAll('.batch-card').forEach((cardEl) => {
+    const img = cardEl.querySelector('img.batch-cover');
+    if (!img) return;
+    const ph = cardEl.querySelector('.batch-cover-ph');
+    img.addEventListener('load', () => { if (ph) ph.hidden = true; });
+    img.addEventListener('error', () => { if (ph) { ph.hidden = false; ph.textContent = '图缺失'; } });
+  });
+  $('batch-cards').querySelectorAll('.batch-cb').forEach((cb) => {
+    cb.addEventListener('change', () => {
+      const id = cb.getAttribute('data-note-id');
+      if (cb.checked) batchChecked.add(id); else batchChecked.delete(id);
+      updateBatchSelCount();
+    });
+  });
+  // 已经有 blob 的（重新渲染时）直接补上
+  $('batch-cards').querySelectorAll('.batch-card').forEach((cardEl) => {
+    const id = cardEl.getAttribute('data-note-id');
+    const img = cardEl.querySelector('img.batch-cover');
+    if (img && batchCoverUrls[id]) img.src = batchCoverUrls[id];
+  });
+  updateBatchSelCount();
+}
+
+function updateBatchSelCount() {
+  $('batch-sel-count').textContent = '已勾选 ' + batchChecked.size + ' / 共 ' + (currentBatch ? currentBatch.hits.length : 0);
+}
+
+async function saveBatchSelection() {
+  const b = currentBatch;
+  if (!b) return;
+  if (!(await ensureWritable())) return;
+  const items = b.hits
+    .filter((h) => h.itemKind === 'note' && batchChecked.has(h.noteId))
+    .map((h) => ({ noteId: h.noteId, rank: h.rank, checkedAt: new Date().toISOString() }));
+  const payload = {
+    sessionId: (b.header && b.header.sessionId) || '',
+    batch: b.name,
+    keyword: (b.header && b.header.keyword) || '',
+    updatedAt: new Date().toISOString(),
+    items: items,
+  };
+  try {
+    await writeJsonFile(b.dir, b.name + SCH.SEARCH_SELECTION_SUFFIX, payload);
+    b.selection = payload;
+    b.selectedCount = items.length;
+    setBatchStatus('已保存勾选 ' + items.length + ' 条到 ' + b.name + SCH.SEARCH_SELECTION_SUFFIX, 'ok');
+  } catch (e) {
+    setBatchStatus('保存勾选失败: ' + ((e && e.message) || e), 'err');
+  }
+}
+
+async function exportBatchSelection(kind) {
+  const b = currentBatch;
+  if (!b) return;
+  const picked = b.hits.filter((h) => h.itemKind === 'note' && batchChecked.has(h.noteId));
+  if (!picked.length) { setBatchStatus('还没有勾选任何条目', 'err'); return; }
+  if (!(await ensureWritable())) return;
+  try {
+    if (kind === 'csv') {
+      const rows = picked.map((h) => SCH.searchHitRow(h, b.header));
+      const csv = '\uFEFF' + SCH.toCsv(SCH.SEARCH_HIT_COLUMNS, rows);
+      await writeTextFile(b.dir, b.name + '.selected.csv', csv);
+      setBatchStatus('已导出 ' + picked.length + ' 行到 ' + SCH.SEARCH_DIR + '/' + b.name + '.selected.csv', 'ok');
+    } else {
+      await writeTextFile(b.dir, b.name + '.selected.jsonl', SCH.toJsonl(picked));
+      setBatchStatus('已导出 ' + picked.length + ' 行到 ' + SCH.SEARCH_DIR + '/' + b.name + '.selected.jsonl', 'ok');
+    }
+    await saveBatchSelection(); // 导出同时留一份勾选记录
+  } catch (e) {
+    setBatchStatus('导出失败: ' + ((e && e.message) || e), 'err');
+  }
+}
+
 
 async function doExport(kind) {  if (!notes.length) { setAnnoStatus('没有可导出的笔记', 'err'); return; }
   if (!(await ensureWritable())) return;
@@ -859,6 +1113,32 @@ document.addEventListener('DOMContentLoaded', async () => {
   // 作者视图
   $('tab-notes').addEventListener('click', () => switchTab('notes'));
   $('tab-authors').addEventListener('click', () => switchTab('authors'));
+  $('tab-batches').addEventListener('click', () => switchTab('batches'));
+
+  // 检索批次视图
+  $('batch-reload').addEventListener('click', async () => {
+    if (!rootHandle || !(await canRead(rootHandle))) { setBatchStatus('请先点右上角「选择归档目录」并授权读取', 'err'); return; }
+    setBatchStatus('正在读取…');
+    await loadBatches();
+    setBatchStatus(batches.length ? ('读到 ' + batches.length + ' 批') : 'searches 目录里还没有批次文件', batches.length ? 'ok' : 'err');
+  });
+  $('batch-back').addEventListener('click', async () => {
+    await saveBatchSelection();
+    releaseCovers();
+    currentBatch = null;
+    renderBatchList();
+  });
+  $('batch-select-all').addEventListener('click', () => {
+    if (!currentBatch) return;
+    for (const h of currentBatch.hits) if (h.itemKind === 'note' && h.noteId) batchChecked.add(h.noteId);
+    renderBatchCards();
+  });
+  $('batch-select-none').addEventListener('click', () => {
+    batchChecked.clear();
+    renderBatchCards();
+  });
+  $('batch-export-jsonl').addEventListener('click', () => exportBatchSelection('jsonl'));
+  $('batch-export-csv').addEventListener('click', () => exportBatchSelection('csv'));
   $('author-search').addEventListener('input', applyAuthorFilter);
   $('author-sort').addEventListener('change', applyAuthorFilter);
   $('author-only-with-notes').addEventListener('change', applyAuthorFilter);
