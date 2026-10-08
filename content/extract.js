@@ -489,6 +489,150 @@
     return Object.values(syncCache.authors).filter((a) => a && a.userId && a.userId !== selfId);
   }
 
+  // ---------- 作者主页的笔记清单（对账用，不做自动归档） ----------
+  // 用途只有一个：回答"这位作者平台上有几篇 / 我们见过哪几篇 / 还差哪几篇"。
+  // 刻意不自动打开详情——那条路已实测走不通（合成点击无效、链接直开 404 ⟹ 见 docs/DESIGN.md）。
+  // 来源两条：① MAIN world 从 `user/posted` 响应压出来的桥节点（主路径，覆盖翻页）；
+  //            ② 页面 DOM 上真实加载出来的卡片链接（兜底，桥没命中时也能拿到一部分）。
+  const PROFILE_LIST_SELECTORS = ['.feeds-container', '[class*="feeds-container"]', '[class*="user-note"]', '[class*="note-list"]'];
+
+  // noteId 归一化只有一处实现（schema 的纯函数），这里只做转发，避免口径分叉
+  function normalizeNoteId(raw) {
+    const sch = S();
+    if (sch && sch.normalizeNoteId) return sch.normalizeNoteId(raw);
+    const s = String(raw == null ? '' : raw).trim();
+    const m = s.match(/\/explore\/([0-9a-zA-Z]+)/);
+    const id = m ? m[1] : s;
+    return /^[0-9a-f]{24}$/i.test(id) ? id.toLowerCase() : '';
+  }
+
+  function profileNotesRoot() {
+    for (const sel of PROFILE_LIST_SELECTORS) {
+      try {
+        const el = document.querySelector(sel);
+        if (el) return el;
+      } catch (e) { /* 试下一个 */ }
+    }
+    return document;
+  }
+
+  let authorNotesBridgeText = null;
+  let authorNotesBridgeValue = null;
+  function readAuthorNotesBridge() {
+    try {
+      const node = document.getElementById('xhs-author-notes');
+      const text = node ? node.textContent : '';
+      if (!text) return null;
+      if (text === authorNotesBridgeText) return authorNotesBridgeValue;
+      const obj = JSON.parse(text);
+      authorNotesBridgeText = text;
+      authorNotesBridgeValue = (obj && typeof obj === 'object') ? obj : null;
+      return authorNotesBridgeValue;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // 内容脚本取走批次后写回 ack（与检索通道同一套增量交接）
+  function ackAuthorNotes(upto) {
+    try {
+      let node = document.getElementById('xhs-author-notes-ack');
+      if (!node) {
+        node = document.createElement('div');
+        node.id = 'xhs-author-notes-ack';
+        node.style.display = 'none';
+        document.documentElement.appendChild(node);
+      }
+      node.textContent = JSON.stringify({ consumed: Number(upto) || 0, at: Date.now() });
+    } catch (e) { /* 忽略 */ }
+  }
+
+  function authorNotesFromDom() {
+    const out = [];
+    try {
+      const links = profileNotesRoot().querySelectorAll('a[href*="/explore/"]');
+      for (const el of links) {
+        let url = null;
+        try { url = new URL(el.getAttribute('href') || '', location.href); } catch (e) { continue; }
+        const id = normalizeNoteId(url.pathname);
+        if (!id) continue;
+        let title = '';
+        try {
+          const img = el.querySelector('img');
+          title = (img && (img.getAttribute('alt') || img.getAttribute('title'))) || el.getAttribute('title') || '';
+        } catch (e) { /* 忽略 */ }
+        out.push({ noteId: id, xsecToken: url.searchParams.get('xsec_token') || '', title: String(title || '').trim(), authorId: '' });
+      }
+    } catch (e) { /* 返回空 */ }
+    return out;
+  }
+
+  // 收集清单：桥优先、DOM 兜底；并做**串号闸门**（桥里的 user_id 必须与当前页面作者一致）
+  function collectAuthorNotes() {
+    const pageUserId = resolveProfileUserId();
+    const bridge = readAuthorNotesBridge();
+    const batches = (bridge && Array.isArray(bridge.batches)) ? bridge.batches : [];
+    const out = [];
+    const seen = {};
+    let lastSeq = 0;
+    let hasMore = null;
+    let cursorLast = null;
+    let declared = null;
+    let dropped = (bridge && bridge.dropped) || 0;
+
+    const push = (n, source) => {
+      const id = normalizeNoteId(n && n.noteId);
+      if (!id || seen[id]) return;
+      seen[id] = true;
+      out.push({
+        noteId: id,
+        xsecToken: (n && n.xsecToken) || '',
+        title: (n && n.title) || '',
+        type: (n && n.type) || '',
+        coverUrl: (n && n.coverUrl) || '',
+        imageCount: (n && typeof n.imageCount === 'number') ? n.imageCount : null,
+        hasVideo: !!(n && n.hasVideo),
+        countsRaw: (n && n.countsRaw) || null,
+        source: source,
+      });
+    };
+
+    for (const b of batches) {
+      const seq = Number(b && b.seq) || 0;
+      if (seq > lastSeq) lastSeq = seq;
+      const reqUserId = (b && b.req && b.req.userId) || '';
+      // 串号闸门：桥里的 user_id 与页面上的作者不一致（用户切了主页/上一批残留）→ 整批丢弃
+      if (pageUserId && reqUserId && String(reqUserId) !== String(pageUserId)) continue;
+      if (b && b.hasMore !== undefined && b.hasMore !== null) hasMore = !!b.hasMore;
+      if (b && b.nextCursor) cursorLast = b.nextCursor;
+      if (b && b.noteCount != null && declared == null) declared = b.noteCount;
+      for (const n of (b && Array.isArray(b.notes)) ? b.notes : []) push(n, 'bridge');
+    }
+    const bridgeCount = out.length;
+    if (!out.length) {
+      for (const n of authorNotesFromDom()) push(n, 'dom');
+    }
+    if (lastSeq) ackAuthorNotes(lastSeq);
+    return {
+      userId: pageUserId,
+      declaredNoteCount: declared,
+      notes: out,
+      hasMore: hasMore,
+      cursorLast: cursorLast,
+      count: out.length,
+      droppedBatches: dropped,
+      source: bridgeCount ? 'bridge' : (out.length ? 'dom' : 'none'),
+      capturedAt: new Date().toISOString(),
+    };
+  }
+
+  // 合并清单：实现只有 schema 一处（纯函数、有单测），这里只做转发
+  function mergeAuthorNotes(existing, incoming, at) {
+    const sch = S();
+    if (!sch || !sch.mergeAuthorNotes) return { notes: {}, added: 0, seen: 0, total: 0 };
+    return sch.mergeAuthorNotes(existing, incoming, at);
+  }
+
   // 登录者本人 id（来自 user/me、user/selfinfo）：只用来"排除自己"。
   // 这三个键名不含裸 'id'，避免深挖时撞上笔记/评论的 id。
   const SELF_ID_KEYS = ['user_id', 'userId', 'userid'];
@@ -1356,6 +1500,7 @@
       readApiCards, readStateIds, readComments, resolveSource, attachProvenance,
       collectProfiles, collectSearchHint, flushAuthorCache, currentProfileUserId, resolveProfileUserId,
       readProfileFromDom, flushCurrentAuthor,
+      collectAuthorNotes, mergeAuthorNotes, normalizeNoteId,
       syncCache,
     },
   };

@@ -552,10 +552,16 @@ P0 已实现：插件版本 `0.2.0`，`_schemaVersion = 2`。下表列出实现�
 | 关键词来源在导出中收敛为 `manual` / `auto` / `auto_edited` / `none` | metadata 保留原始的 `url_auto` / `none`，导出层归一化便于直接做交叉表 |
 | 新增 `tests/selftest.js` | 把可自动化的验收项固定下来，避免后续改动再次踩到同类的契约漂移 |
 | 删除 `background.js` 的归档死分支 | 全仓库无 `archiveNote` 发送方；连同它专用的 IndexedDB 句柄读取、`pickVideoUrl`、`writeFile`、`fetchBytes` 等约 120 行一并删除。写盘实现从三份降到两份，"三处分别改"的维护面随之缩小 |
+| 页面按钮默认形态的判据写错（v0.3.1 修复） | 旧代码是 `panelOpen = !(panelMode === 'collapsed')`，而 `panelMode` 只在**用户手动改过弹窗下拉框**时才写入 storage。于是"从没设置过"被算成"展开"——每次打开小红书页面，详情面板都自己弹出来（用户实测报障）。现在改为只有 `panelMode === 'expanded'` 才展开：**默认值只声明在 popup.html 与 README，代码不再自己造默认源** |
+| 作者笔记清单对账（v0.3.1，A 方案） | 主页加载时页面自己会请求 `/api/sns/web/v1/user_posted`（参数在 query：`user_id`/`cursor`/`num`），`network.js` 把它压成薄卡片写进**新桥节点 `#xhs-author-notes`**（与 `MAP` 严格隔离，防止主页列表的薄卡片挤进"当前笔记"候选池）；`extract.js` 的 `collectAuthorNotes()` 读桥节点（DOM 卡片链接兜底），并做**串号闸门**（桥里 `user_id` ≠ 当前页面作者 → 整批丢弃）；作者主页上内容有变时才由 `archive.js` 的 `saveAuthorNotes()` 写 `_meta/authors/<userId>.json`（按 noteId 并集、`firstSeenAt` 保留、`archived` 只增不减）；管理页作者视图新增「清单 / 未归档」列与"还差哪几篇"清单。**它不自动打开任何笔记**，归档仍靠人工 📥 —— 这是 A 的边界 |
+| 对账的两处显示与"已归档"标记怎么来 | 对账逻辑只有**一处实现**（`schema.buildAuthorReconcile` + `archivedIdsOfManifest`），**三处显示共用**：① 折叠态工具栏上的小徽标 `已归档/清单`（`main.js` 的 `updateToolbarBadge()`，点一下展开面板）；② 展开面板里的「清单对账」块；③ 管理页作者视图的「清单 / 未归档」列 —— 口径不会分叉（自检里有断言守着）。`archived` 标记**不靠遍历 metadata.json**（页面源句柄读不到扩展源选的目录，见「双句柄域」），而是**每次归档顺手在清单文件里翻一位**：页面 📥 走 `archive.js` 的 `writeNoteAndMark()`，弹窗归档走 `popup.js` 的 `markArchivedInAuthorManifest()` —— 两条路径各写一次，因为句柄来源不同。这样面板在作者主页上只需读一个几 KB 的清单文件，就能显示"平台 N 篇 / 清单 M 篇 / 已归档 K 篇 / 还差 J 篇" |
+| 为什么"程序化打开笔记详情"这条路放弃了（三轮实测） | ① 合成点击**不触发**详情加载：卡片元素定位已确认正确（`section.note-item`），派发完整鼠标序列 + 原生 `click()`（含坐标、bubbles、前置悬停）后页面无反应，三轮复现；② 照搬卡片 href（含其自带 `xsec_token`）直开 → **404**；③ 在其上补 `xsec_source=app_share` 后仍 **404**，而**手动**粘贴同一形式的地址（token + `app_share`）能打开 ⟹ 凭据与点击那一刻的上下文绑定、且短时效。公开实现对照：成熟工具全部走**签名接口**（[xhshow-ts](https://github.com/ikenxuan/xhshow-ts) 就以 `user_posted` 为示例：需 `a1` Cookie + `x-s`/`x-s-common`/`x-t`，2026-03 起数据接口改用 `XYW_`），被动采集型扩展（[xiaohongshu-content-collector](https://github.com/fancyyan/xiaohongshu-content-collector)）也只做"被动拦截 + DOM 补全"，实时读详情靠外挂本地 CLI。**结论：在本插件"不构造请求 / 不读凭据"的原则下无解** |
 
 仍未实现（属于 P2）：DOM 桥自触发回路优化、缓存淘汰。
 
-**明确不做**（用户已决定）：重复归档快照 / 传播曲线（统计数不做时间序列，见下）、检索接口拦截与 `resultRank`（改为管理页人工补录）、会话日志 CSV（内容已并入 metadata）、批量归档（保持人工节奏）。
+**明确不做**（用户已决定）：重复归档快照 / 传播曲线（统计数不做时间序列，见下）、检索接口拦截与 `resultRank`（改为管理页人工补录）、会话日志 CSV（内容已并入 metadata）。
+
+> 📌 「批量归档」最终口径（v0.3.1）：**不做**"一键归档该作者全部笔记"（详情页凭据程序化打不开，见上表"为什么放弃"）。**做的是对账**：作者主页顺手记下作品清单 → 落 `_meta/authors/<userId>.json` → 管理页作者视图显示"平台声明 / 清单 / 已归档 / 还差哪几篇"。这解决的是"我以为存全了其实漏了"，而不是"少点几下"。归档动作始终由人工 📥 触发。
 
 > 📌 **重复归档的语义**：同一篇笔记再次归档会**覆盖**该目录下的 `metadata.json`（以及 `comments.json`），统计数即"最后一次归档时的值"。所以 `stats` 是快照、不是时间序列；`_archiveTime` 记录的就是这次快照的时刻。需要在分析时区分"哪次归档"，就看它。
 

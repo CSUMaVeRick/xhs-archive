@@ -282,7 +282,8 @@ h1 { font-size: 18px; margin: 0; flex: 1; }
 .author-list { padding: 0 24px 40px; }
 .author-row {
   display: grid;
-  grid-template-columns: minmax(140px, 1.6fr) 1fr 0.7fr 0.7fr 0.7fr 0.9fr 1fr 0.7fr 0.7fr 1fr;
+  /* 作者 / 小红书号 / 粉丝 / 关注 / 笔记 / 获赞与收藏 / 认证 / 属地 / 已归档 / 清单·未归档 / 最近观测 */
+  grid-template-columns: minmax(140px, 1.5fr) 1fr 0.7fr 0.7fr 0.7fr 0.9fr 1fr 0.7fr 0.7fr 0.9fr 1fr;
   gap: 10px;
   align-items: center;
   padding: 10px 12px;
@@ -306,6 +307,8 @@ h1 { font-size: 18px; margin: 0; flex: 1; }
 .a-num { text-align: right; font-variant-numeric: tabular-nums; }
 .a-dim { color: #999; word-break: break-all; }
 .a-hist { color: #b26a00; font-weight: 400; font-size: 11px; }
+/* 清单对账里"还没归档"的篇数：刻意用醒目色，这是这个视图最该被看到的数字 */
+.a-miss { color: #d93025; font-weight: 600; }
 .author-note {
   display: flex;
   justify-content: space-between;

@@ -28,6 +28,25 @@
 .xhs-tb button:hover { background: rgba(255, 255, 255, 0.35); }
 .xhs-tb.xhs-tb-flash { transform: scale(1.08); }
 
+/* 折叠态就能看到的小进度徽标（只在作者主页、且有对账数据时出现）
+   显示"已归档/清单总数"，点一下展开面板看"还差哪几篇" */
+.xhs-tb-badge {
+  display: none;
+  border: none;
+  background: rgba(255, 255, 255, 0.92);
+  color: #ff2442;
+  border-radius: 10px;
+  padding: 3px 5px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.2px;
+  font-family: inherit;
+}
+.xhs-tb-badge:hover { background: #fff; }
+.xhs-tb-badge.is-done { background: rgba(255, 255, 255, 0.35); color: #fff; font-weight: 600; }
+
 /* 短暂提示 toast */
 .xhs-toast {
   position: fixed;
@@ -96,6 +115,12 @@
   font-size: 12px;
 }
 #xhs-panel .xr-body { padding: 10px 12px; }
+/* 清单对账块：只在作者主页出现，用可读性更强的行距，未归档清单用小字列表 */
+#xhs-panel .xr-recon { line-height: 1.6; }
+#xhs-panel .xr-recon-list {
+  margin-top: 4px; padding-top: 4px; border-top: 1px dashed #ffe0b2;
+  font-size: 11px; line-height: 1.5; max-height: 132px; overflow: auto;
+}
 #xhs-panel .xr-row { display: flex; gap: 8px; padding: 3px 0; border-bottom: 1px dashed #f0f0f0; }
 #xhs-panel .xr-k { flex: 0 0 64px; color: #999; }
 #xhs-panel .xr-v { flex: 1; word-break: break-all; color: #333; }

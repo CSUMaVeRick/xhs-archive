@@ -146,6 +146,20 @@
         dropped: SEARCH_DROPPED,
         batches: SEARCH_BATCHES,
       });
+      // 作者主页的笔记清单（同样是增量交接；用于"这位作者有几篇 / 我归档了哪几篇"的对账）
+      ackAuthorNotes();
+      let an = document.getElementById('xhs-author-notes');
+      if (!an) {
+        an = document.createElement('div');
+        an.id = 'xhs-author-notes';
+        an.style.display = 'none';
+        document.documentElement.appendChild(an);
+      }
+      an.textContent = JSON.stringify({
+        updatedAt: Date.now(),
+        dropped: AUTHOR_NOTES_DROPPED,
+        batches: AUTHOR_NOTES_BATCHES,
+      });
     } catch (e) {
       // 忽略
     }
@@ -164,6 +178,118 @@
   const MAX_PENDING_BATCHES = 8; // 内容脚本几百毫秒内就会取走；留 8 批只为兜住短暂停顿
   let SEARCH_SEQ = 0;
   let SEARCH_DROPPED = 0;
+
+  // ---------------- 作者主页笔记清单通道（对账用） ----------------
+  // 与笔记缓存（MAP）刻意隔离：主页列表的卡片是薄卡片（没有正文、统计也可能是另一套字段），
+  // 塞进 MAP 会挤掉详情卡片，重新制造"A 的元数据写进 B 目录"那类错标。
+  //
+  // 用途只有一个：回答"这位作者平台上有几篇 / 我们见过哪几篇 / 还差哪几篇"。
+  // 不做自动打开详情——那条路已实测走不通（合成点击无效、链接直开 404），见 docs/DESIGN.md。
+  // ⚠ 两个容易写错的点：① 路径是 `user_posted`（下划线，不是 user/posted）；
+  // ② 别用 `[^?#]*` 当间隔 —— 参数都在 query 里，`?` 会被挡在中间导致匹配不到。
+  const AUTHOR_NOTES_RE = /\/api\/.*user_posted/i;
+  const AUTHOR_REQ = {};          // url -> 请求参数（user_id / cursor / num）
+  const AUTHOR_NOTES_BATCHES = [];
+  let AUTHOR_NOTES_SEQ = 0;
+  let AUTHOR_NOTES_DROPPED = 0;
+
+  // 作者作品接口的参数在 query 里（GET），但也容错读一下 body
+  function rememberAuthorRequest(url, body) {
+    if (!url || !AUTHOR_NOTES_RE.test(String(url))) return;
+    let q = null;
+    try { q = new URL(String(url), location.href).searchParams; } catch (e) { q = null; }
+    let parsed = null;
+    try {
+      if (typeof body === 'string' && body) parsed = JSON.parse(body);
+      else if (body && typeof body === 'object') parsed = body;
+    } catch (e) { parsed = null; }
+    const pick = (name1, name2) => {
+      const a = q ? q.get(name1) : null;
+      const b = parsed ? (parsed[name1] != null ? parsed[name1] : parsed[name2]) : null;
+      return a != null ? a : (b != null ? b : null);
+    };
+    AUTHOR_REQ[String(url)] = {
+      userId: pick('user_id', 'userId'),
+      cursor: pick('cursor', null),
+      num: pick('num', 'page_size'),
+    };
+  }
+
+  // 一张薄的清单卡片：只留对账与"路标"需要的字段。
+  // liked/collected 依然是浏览者状态，在这里就丢掉（与检索通道同一口径）。
+  function reduceAuthorNote(item) {
+    if (!item || typeof item !== 'object') return null;
+    const id = item.id || item.noteId || item.note_id || '';
+    if (!id) return null;
+    const c = item.note_card || item.noteCard || item;
+    const info = c.interact_info || c.interactInfo || {};
+    const user = c.user || {};
+    const cover = c.cover || {};
+    const imgs = c.image_list || c.imageList;
+    return {
+      noteId: String(id),
+      xsecToken: item.xsec_token || item.xsecToken || '',
+      title: String(c.display_title || c.displayTitle || c.title || '').trim(),
+      type: c.type || '',
+      coverUrl: cover.url_default || cover.urlDefault || '',
+      imageCount: Array.isArray(imgs) ? imgs.length : null,
+      hasVideo: !!(c.video && (c.video.media || c.video.consumer)) || String(c.type || '') === 'video',
+      authorId: user.user_id || user.userId || '',
+      countsRaw: {
+        likeCount: pickFirst(info.liked_count, info.likedCount),
+        collectCount: pickFirst(info.collected_count, info.collectedCount),
+        commentCount: pickFirst(info.comment_count, info.commentCount),
+        shareCount: pickFirst(info.shared_count, info.sharedCount),
+      },
+    };
+  }
+
+  // 响应形状容错：有的版本是 data.notes，有的放在 data.items / data.note_list
+  function authorNotesOf(json) {
+    const d = (json && json.data) || {};
+    for (const key of ['notes', 'items', 'note_list', 'noteList']) {
+      if (Array.isArray(d[key])) return d[key];
+    }
+    return null;
+  }
+
+  function ingestAuthorNotes(json, url) {
+    if (!url || !AUTHOR_NOTES_RE.test(String(url))) return false;
+    const items = authorNotesOf(json);
+    if (!items) return false;
+    const d = (json && json.data) || {};
+    const req = AUTHOR_REQ[String(url)] || null;
+    const notes = items.map(reduceAuthorNote).filter(Boolean);
+    if (!notes.length) return false;
+    AUTHOR_NOTES_BATCHES.push({
+      seq: ++AUTHOR_NOTES_SEQ,
+      at: Date.now(),
+      url: String(url).slice(0, 200),
+      req: req ? { userId: req.userId, cursor: req.cursor, num: req.num } : null,
+      hasMore: d.has_more !== undefined ? !!d.has_more : (d.hasMore !== undefined ? !!d.hasMore : null),
+      nextCursor: d.cursor || null,
+      noteCount: d.note_count != null ? d.note_count : (d.noteCount != null ? d.noteCount : null),
+      notes: notes,
+    });
+    while (AUTHOR_NOTES_BATCHES.length > MAX_PENDING_BATCHES) {
+      AUTHOR_NOTES_BATCHES.shift();
+      AUTHOR_NOTES_DROPPED++;
+    }
+    return true;
+  }
+
+  function ackAuthorNotes() {
+    try {
+      const node = document.getElementById('xhs-author-notes-ack');
+      if (!node || !node.textContent) return;
+      const ack = JSON.parse(node.textContent);
+      const upto = Number(ack && ack.consumed);
+      if (!Number.isFinite(upto)) return;
+      while (AUTHOR_NOTES_BATCHES.length && AUTHOR_NOTES_BATCHES[0].seq <= upto) AUTHOR_NOTES_BATCHES.shift();
+    } catch (e) {
+      // 忽略
+    }
+  }
 
   function pickFirst(a, b) {
     return a != null ? a : (b != null ? b : null);
@@ -354,6 +480,7 @@
       }
       if (changed) window.__XHS_NOTE_API__ = MAP;
       ingestSearchBatch(json, url);
+      ingestAuthorNotes(json, url);
       ingestCommentApi(json, url);
       flushToDom(); // URL 列表也变了，无条件刷新（与原行为一致）
     } catch (e) {
@@ -370,6 +497,7 @@
         const url = typeof input === 'string' ? input : (input && input.url) || '';
         if (isXhsApiUrl(url)) {
           rememberSearchRequest(url, init && init.body);
+          rememberAuthorRequest(url, init && init.body);
           p.then((resp) => {
             try {
               const ct = (resp.headers && resp.headers.get && resp.headers.get('content-type')) || '';
@@ -394,6 +522,7 @@
   };
   XMLHttpRequest.prototype.send = function () {
     try { rememberSearchRequest(this.__xhs_url, arguments[0]); } catch (e) { /* 忽略 */ }
+    try { rememberAuthorRequest(this.__xhs_url, arguments[0]); } catch (e) { /* 忽略 */ }
     try {
       this.addEventListener('load', function () {
         try {
@@ -635,5 +764,6 @@
   window.__XHS_STATE_INGEST__ = ingestStateNote; // 供自检直接调用
   window.__XHS_INGEST__ = ingest; // 供自检验证"哪些接口会被处理"
   window.__XHS_SEARCH_BATCHES__ = function () { return SEARCH_BATCHES; }; // 供自检
+  window.__XHS_AUTHOR_NOTES__ = function () { return AUTHOR_NOTES_BATCHES; }; // 供自检
   ingestStateNote();  setInterval(ingestStateNote, 1500); // SPA 内切笔记时状态会更新，靠轮询兜住
 })();

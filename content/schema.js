@@ -476,6 +476,92 @@
     return { authors: authors, added: added, changed: changed, confirmed: confirmed };
   }
 
+  // ---------- 作者笔记清单（对账用） ----------
+  // 纯函数：把"新抓到的清单"合并进"已有清单"。
+  //  ① 按 noteId 取并集（同一篇反复出现只留一条）；
+  //  ② firstSeenAt 保留最早一次，lastSeenAt 刷新为本次；
+  //  ③ `archived` 只增不减 —— 一次扫描没看到某篇，不能把它"已归档"的事实清掉；
+  //  ④ 归一化 noteId（只认 24 位十六进制），非法条目直接丢弃。
+  const NOTE_ID_RE = /^[0-9a-f]{24}$/i;
+
+  function normalizeNoteId(raw) {
+    const s = String(raw == null ? '' : raw).trim();
+    const m = s.match(/\/explore\/([0-9a-zA-Z]+)/);
+    const id = m ? m[1] : s;
+    return NOTE_ID_RE.test(id) ? id.toLowerCase() : '';
+  }
+
+  function mergeAuthorNotes(existing, incoming, now) {
+    const when = now || new Date().toISOString();
+    const notes = {};
+    const shape = (existing && existing.notes) || null;
+    // 已有清单既可能是落盘时的数组（文件里），也可能是上一次合并返回的 map（内存里），两种都吃
+    const oldList = Array.isArray(shape) ? shape : (shape && typeof shape === 'object' ? Object.values(shape) : []);
+    for (const n of oldList) {
+      const id = normalizeNoteId(n && n.noteId);
+      if (!id) continue;
+      notes[id] = Object.assign({}, n, { noteId: id });
+    }
+    let added = 0, seen = 0;
+    for (const n of (Array.isArray(incoming) ? incoming : [])) {
+      const id = normalizeNoteId(n && n.noteId);
+      if (!id) continue;
+      const old = notes[id];
+      if (!old) {
+        notes[id] = Object.assign({}, n, { noteId: id, firstSeenAt: when, lastSeenAt: when, archived: false });
+        added++;
+      } else {
+        // 已有字段里"非空值"优先保留：清单卡片有时缺标题/封面，不该把已知值抹成空
+        const next = Object.assign({}, old);
+        for (const k of Object.keys(n || {})) {
+          const v = n[k];
+          if (v === undefined || v === null || v === '') continue;
+          next[k] = v;
+        }
+        next.noteId = id;
+        next.firstSeenAt = old.firstSeenAt || when;
+        next.lastSeenAt = when;
+        next.archived = !!old.archived;
+        notes[id] = next;
+        seen++;
+      }
+    }
+    return { notes: notes, added: added, seen: seen, total: Object.keys(notes).length };
+  }
+
+  // 对账：平台声明几篇 / 清单见过几篇 / 已归档几篇 / 还差哪几篇。
+  // 管理页与页面面板共用这一份实现，避免两处口径分叉（有单测）。
+  function buildAuthorReconcile(manifest, archivedIds) {
+    const has = archivedIds || {};
+    const all = (manifest && Array.isArray(manifest.notes)) ? manifest.notes : [];
+    const notArchived = all.filter((n) => {
+      const id = normalizeNoteId(n && n.noteId);
+      return !!id && !has[id];
+    });
+    const declared = (manifest && manifest.author && manifest.author.declaredNoteCount != null)
+      ? manifest.author.declaredNoteCount : null;
+    return {
+      declared: declared,
+      listed: all.length,
+      archived: all.length - notArchived.length,
+      missing: notArchived.length,
+      notArchived: notArchived,
+      capturedAt: (manifest && manifest.coverage && manifest.coverage.capturedAt) || null,
+      source: (manifest && manifest.coverage && manifest.coverage.source) || 'unknown',
+    };
+  }
+
+  // 从清单里取"已归档"的 noteId 集合（归档时由 archive.js 顺手写进清单）
+  function archivedIdsOfManifest(manifest) {
+    const out = {};
+    const all = (manifest && Array.isArray(manifest.notes)) ? manifest.notes : [];
+    for (const n of all) {
+      const id = normalizeNoteId(n && n.noteId);
+      if (id && n && n.archived) out[id] = true;
+    }
+    return out;
+  }
+
   // 从作者表里移除某个 userId（用于清掉误收的"登录者本人"记录）
   function removeAuthor(authors, userId) {
     const out = Object.assign({}, authors || {});
@@ -746,6 +832,10 @@
     AUTHOR_EXPORT_COLUMNS,
     mergeAuthors,
     removeAuthor,
+    mergeAuthorNotes,
+    normalizeNoteId,
+    buildAuthorReconcile,
+    archivedIdsOfManifest,
     buildAuthorRows,
     authorsFileShell,
     authorExportRow,

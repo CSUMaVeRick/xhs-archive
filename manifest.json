@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "XHS Archive",
-  "version": "0.3.0",
-  "description": "从小红书帖子页抽取数据用于本地归档；支持在搜索结果页做一次有界的粗糙采集（命中清单）用于挑选归档对象。",
+  "version": "0.3.1",
+  "description": "从小红书帖子页抽取数据用于本地归档；支持在搜索结果页做一次有界的粗糙采集（命中清单）用于挑选归档对象；作者主页会顺带记下笔记清单，便于在管理页核对「还差哪几篇」。",
   "permissions": ["downloads", "storage", "declarativeNetRequest"],
   "host_permissions": [
     "https://www.xiaohongshu.com/*",

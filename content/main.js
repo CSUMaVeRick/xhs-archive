@@ -30,6 +30,8 @@
 
   let lastData = null;
   let panelOpen = false; // 是否展开详情面板
+  let lastAuthorNotes = null;  // 最近一次在作者主页收集到的清单（只用于面板显示与落盘判断）
+  let authorManifest = null;   // 已落盘的清单（含 archived 标记），供面板对账显示
 
   // ---------- 设置（弹窗里的开关 + 面板上的展开范围） ----------
   // 面板渲染是同步的，所以用内存缓存；storage 变化时同步刷新
@@ -108,6 +110,7 @@
            : (res.videoOk ? '，视频已下载' : `，视频失败: ${res.videoErr || '未知'}`))
         : '';
       showToast(`完成 ✅ 图片${res.ok}张${videoMsg}`, 'ok');
+      loadAuthorManifest(true); // 归档完刷新对账（徽标与面板上的"还差"会立刻跟着变）
     } catch (e) {
       showToast('页面内归档失败: ' + String(e && e.message || e) + '，改用弹窗...', 'err');
       try {
@@ -138,12 +141,18 @@
       tb.className = 'xhs-tb';
       tb.innerHTML = `
         <button class="xhs-tb-archive" title="归档当前笔记">📥</button>
+        <button class="xhs-tb-badge" title="清单对账"></button>
         <button class="xhs-tb-toggle" title="展开 / 收起详情">⟨</button>
       `;
       tb.querySelector('.xhs-tb-archive').addEventListener('click', () => {
         archiveCurrentNote();
         tb.classList.add('xhs-tb-flash');
         setTimeout(() => tb.classList.remove('xhs-tb-flash'), 400);
+      });
+      // 徽标点一下 = 展开面板看"还差哪几篇"（顺便把清单重读一次，数字是新的）
+      tb.querySelector('.xhs-tb-badge').addEventListener('click', () => {
+        loadAuthorManifest(true);
+        setPanelVisible(true);
       });
       tb.querySelector('.xhs-tb-toggle').addEventListener('click', () => {
         panelOpen = !panelOpen;
@@ -178,6 +187,7 @@
         if (r && r.data && (r.data.noteId || r.data.title)) renderPanel(r);
         else if (lastData) renderPanel({ data: lastData, report: {}, strategy: '' });
       } catch (e) {}
+      loadAuthorManifest(false); // 在作者主页上顺手把清单读进来，对账行才有数
     }
   }
 
@@ -214,12 +224,20 @@
     }
 
     // 在作者主页时先给出"当前作者"这一行：点保存之前就能看出解析到没解析到
+    let reconcileHtml = '';
     try {
       if (onProfilePage) {
         const rec = X().helpers.readProfileFromDom();
         if (rec) {
           rows.unshift(['当前作者', `${rec.nickname || '?'} · 粉丝 ${rec.fansCount == null ? '未知' : rec.fansCount} · 关注 ${rec.followsCount == null ? '未知' : rec.followsCount}${rec.ipLocation ? ' · ' + rec.ipLocation : ''}`]);
         }
+        // 清单对账：平台声明几篇 / 清单见过几篇 / 已归档几篇 / 还差哪几篇
+        const an = lastAuthorNotes;
+        if (an && an.count) {
+          const declared = (an.declaredNoteCount == null) ? '平台未声明' : (an.declaredNoteCount + ' 篇');
+          rows.unshift(['笔记清单', `平台 ${declared} · 清单 ${an.count} 篇（${an.source === 'bridge' ? '接口' : '页面'}）`]);
+        }
+        reconcileHtml = renderReconcileBlock();
       }
     } catch (e) { /* 解析失败就少显示一行，不影响其它信息 */ }
 
@@ -256,6 +274,7 @@
       ${mismatchWarn}
       ${missWarn}
       <div class="xr-body">${rowHtml}</div>
+      ${reconcileHtml}
       ${settings.collectComments ? `<div class="xr-expand">
         <button class="xr-dlbtn xr-expand-btn">${expandRunning ? '停止展开' : '展开评论'}</button>
         <select class="xr-expand-scope" title="展开多少条回复">
@@ -590,6 +609,72 @@
   }
 
   // 注意：这里没有 force 参数。面板自己的刷新走 renderPanel，抽取只在数据真的变化时才动。
+  // ---------- 作者主页：笔记清单采集与落盘（对账，不做自动归档） ----------
+  // 只回答"这位作者平台上有几篇 / 我们见过哪几篇 / 还差哪几篇"。
+  // 落盘写 `_meta/authors/<userId>.json`，管理页拿它跟已归档的 metadata 对账。
+  // 说明：清单里的链接（xsec_token）会过期，只是路标 —— 详情仍由人工用 📥 逐篇归档。
+  let authorNotesSavedSig = '';
+  let authorNotesBusy = false;
+
+  function collectAuthorNotesTick() {
+    const x = X();
+    const A = window.__XHS_ARCHIVE__;
+    if (!x || !x.helpers || !x.helpers.collectAuthorNotes || !A || !A.saveAuthorNotes) return;
+    if (authorNotesBusy) return;
+    let data = null;
+    try { data = x.helpers.collectAuthorNotes(); } catch (e) { return; }
+    if (!data || !data.userId || !data.count) return;
+    lastAuthorNotes = data;
+    // 先用手上这份清单让徽标/面板立刻有数（归档标记稍后由落盘读回补上），
+    // 否则"第一次进某个作者主页"就永远没有数字 —— 因为下面那次落盘还没完成。
+    const S = window.XHS_SCHEMA || null;
+    if (S && S.mergeAuthorNotes) {
+      const base = (authorManifest && authorManifestFor === data.userId) ? authorManifest : null;
+      const merged = S.mergeAuthorNotes(base, data.notes, data.capturedAt);
+      authorManifest = Object.assign({}, base || {}, {
+        author: Object.assign({}, (base && base.author) || {}, {
+          userId: data.userId,
+          declaredNoteCount: data.declaredNoteCount == null
+            ? ((base && base.author && base.author.declaredNoteCount) || null)
+            : data.declaredNoteCount,
+        }),
+        coverage: {
+          source: data.source,
+          hasMore: data.hasMore,
+          cursorLast: data.cursorLast,
+          capturedAt: (base && base.coverage && base.coverage.capturedAt) || data.capturedAt,
+          inMemory: true,
+        },
+        notes: Object.values(merged.notes),
+      });
+      authorManifestFor = data.userId;
+      updateToolbarBadge();
+    }
+    // 内容没变就不重复写盘（这个 tick 每 2.5 秒跑一次，HOME 页 DOM 会一直抖）
+    const sig = [
+      data.userId, data.count, data.source,
+      data.declaredNoteCount == null ? '' : data.declaredNoteCount,
+      data.hasMore === null ? '' : data.hasMore,
+      data.cursorLast || '',
+    ].join('|');
+    if (sig === authorNotesSavedSig) return;
+    authorNotesSavedSig = sig;
+
+    authorNotesBusy = true;
+    let authorInfo = null;
+    try { authorInfo = x.helpers.flushCurrentAuthor ? x.helpers.flushCurrentAuthor() : null; } catch (e) { /* 忽略 */ }
+    Promise.resolve()
+      .then(() => A.saveAuthorNotes(data, authorInfo))
+      .then((res) => {
+        if (res && res.ok) {
+          console.log('[XHS Archive] 作者清单已写入', res.file, '共', res.total, '条（新增', res.added, '）');
+          loadAuthorManifest(true);   // ⚠ 必须**写完之后**再读回：同一 tick 里读会读到"文件还不存在"
+        }
+      })
+      .catch((e) => { authorNotesSavedSig = ''; console.log('[XHS Archive] 作者清单落盘失败', e && e.message); })
+      .then(() => { authorNotesBusy = false; });
+  }
+
   function runExtract() {
     const x = X();
     if (!x) return;
@@ -597,11 +682,16 @@
     // 若把捕获挂在 extract() 里，作者页那一轮就永远收不到资料。函数内部有内容未变即返回的短路。
     try { if (x.helpers && x.helpers.collectProfiles) x.helpers.collectProfiles(); } catch (e) {}
     try { if (x.helpers && x.helpers.collectSearchHint) x.helpers.collectSearchHint(); } catch (e) {}
+    // 作者主页的笔记清单：只做"对账数据"的采集与落盘，不自动打开任何笔记。
+    // 内部有内容未变即返回的短路，且只在作者主页上跑。
+    collectAuthorNotesTick();
     const visible = x.detectNoteVisible();
     const { tb } = ensureUI();
     // 面板开着就不隐藏工具栏：正在进行交互时让它消失是最容易被当成 bug 的行为。
     // display 置空串而不是 'block'，否则会把 .xhs-tb 的 flex 竖排覆盖成横排。
     if (tb) tb.style.display = (visible || panelOpen) ? '' : 'none';
+    // 折叠态的小进度徽标（作者主页上有清单时出现）
+    updateToolbarBadge(true); // 带日志：徽标为什么不出现，控制台里能直接看到
 
     if (visible) {
       const result = x.extract();
@@ -628,6 +718,107 @@
     }
   }
 
+  // ---------- 作者主页：清单对账（面板里直接看到"还差哪几篇"） ----------
+  // 数据来自 `_meta/authors/<userId>.json`：清单在打开主页时落盘，`archived` 标记由每次归档顺手刷新。
+  // 全程只读本地文件，不构造任何请求；失败（没配目录 / 没权限 / 还没清单）都安静降级为一行提示。
+  function renderReconcileBlock() {
+    const S = window.XHS_SCHEMA || null;
+    const userId = profilePageUserId();
+    const m = userId ? authorManifest : null;
+    if (!userId) return '';
+    if (!m) {
+      return `<div class="xr-warn xr-recon">清单对账：还没有这位作者的清单 —— 往下滚一屏（插件会顺手记下来），再点开本面板。</div>`;
+    }
+    const rec = (S && S.buildAuthorReconcile)
+      ? S.buildAuthorReconcile(m, (S.archivedIdsOfManifest ? S.archivedIdsOfManifest(m) : {}))
+      : null;
+    if (!rec || !rec.listed) return '';
+    const declared = rec.declared == null ? '平台未声明' : (rec.declared + ' 篇');
+    const head = `清单对账：平台 ${declared} · 清单 ${rec.listed} 篇 · 已归档 ${rec.archived} 篇`;
+    const tail = rec.missing
+      ? `<b>还差 ${rec.missing} 篇</b>（下面列出来了，逐篇点开用 📥 归档）`
+      : `<b>清单已全部归档</b>`;
+    const when = rec.capturedAt ? String(rec.capturedAt).slice(0, 16).replace('T', ' ') : '—';
+    const missList = rec.notArchived.slice(0, 12).map((n) => {
+      const title = n.title ? String(n.title).slice(0, 24) : '(无标题)';
+      return `${escapeHtml(title)} <span style="opacity:.6">${escapeHtml(String(n.noteId || '').slice(0, 8))}…</span>`;
+    }).join('<br>');
+    const more = rec.missing > 12 ? `<br><span style="opacity:.6">…还有 ${rec.missing - 12} 篇（管理页作者视图可看全）</span>` : '';
+    const stale = (Date.now() - (Date.parse(rec.capturedAt || '') || 0)) > 30 * 60 * 1000;
+    return `<div class="xr-warn xr-recon">${head} · ${tail}<br>`
+      + `<span style="opacity:.75">清单抓取于 ${escapeHtml(when)}（${rec.source === 'bridge' ? '接口' : '页面'}）；`
+      + `清单里的链接会过期${stale ? '，已经放了一会儿了，建议回主页滚一次刷新' : ''}</span>`
+      + (rec.missing ? `<div class="xr-recon-list">${missList}${more}</div>` : '')
+      + `</div>`;
+  }
+
+  // 打开主页时把清单读进来（只读本地文件；拿不到就留空，面板会提示"往下滚一屏"）
+  let authorManifestFor = '';
+  async function loadAuthorManifest(force) {
+    const A = window.__XHS_ARCHIVE__;
+    const userId = profilePageUserId();
+    if (!userId) { authorManifest = null; authorManifestFor = ''; return; }
+    if (!A || !A.readAuthorNotes) { authorManifest = null; return; }
+    if (!force && authorManifestFor === userId && authorManifest) return; // 同一个作者只读一次
+    const had = authorManifest;
+    try {
+      authorManifest = await A.readAuthorNotes(userId, !!force);
+    } catch (e) {
+      authorManifest = null;
+    }
+    authorManifestFor = userId;
+    updateToolbarBadge(); // 折叠态那个小徽标跟着刷新
+    // 读到了新内容且面板开着 → 重画一次，让"还差哪几篇"立刻出现
+    if (panelOpen && JSON.stringify(authorManifest || null) !== JSON.stringify(had || null)) {
+      try {
+        const r = X().extract();
+        if (r && r.data) renderPanel(r);
+      } catch (e) { /* 忽略 */ }
+    }
+  }
+
+  // 折叠态的小进度徽标：只在作者主页、且清单有数据时出现。
+  // 文案刻意短：徽标宽度只有 34px，`7/18` 比"已归档 7/18"读得快。
+  let badgeDiagLast = '';
+  function badgeDiag(msg) {
+    if (msg === badgeDiagLast) return; // 每 300ms 一次的抽取循环，别把控制台刷满
+    badgeDiagLast = msg;
+    console.log('[XHS Archive] 徽标：' + msg);
+  }
+
+  function updateToolbarBadge(diag) {
+    try {
+      const tb = document.getElementById('xhs-tb');
+      if (!tb) return;
+      const el = tb.querySelector('.xhs-tb-badge');
+      if (!el) {
+        if (diag) badgeDiag('工具栏里没有 .xhs-tb-badge 元素（扩展需要重新加载）');
+        return;
+      }
+      const hide = (why) => {
+        el.style.display = 'none';
+        if (diag) badgeDiag('不显示 —— ' + why);
+      };
+      const S = window.XHS_SCHEMA || null;
+      const userId = profilePageUserId();
+      const m = userId ? authorManifest : null;
+      if (!userId) return hide('当前页面不是作者主页');
+      if (!S || !S.buildAuthorReconcile || !S.archivedIdsOfManifest) return hide('schema 缺对账函数（扩展需要重新加载）');
+      if (!m) return hide('还没有这位作者的清单（往下滚一屏，让页面自己请求作品列表）');
+      const rec = S.buildAuthorReconcile(m, S.archivedIdsOfManifest(m));
+      if (!rec.listed) return hide('清单是空的（接口/页面都没抓到条目）');
+      // ⚠ 这里必须写具体的 display 值，不能写空串：空串 = 移除 inline 样式、退回 CSS，
+      // 而 `.xhs-tb-badge` 的 CSS 默认就是 display:none —— 于是"设了内容却永远看不见"（踩过）。
+      el.style.display = 'inline-block';
+      el.textContent = rec.archived + '/' + rec.listed;
+      el.classList.toggle('is-done', rec.missing === 0);
+      el.title = '清单对账：平台 ' + (rec.declared == null ? '未声明' : rec.declared + ' 篇')
+        + ' · 清单 ' + rec.listed + ' 篇 · 已归档 ' + rec.archived + ' 篇'
+        + (rec.missing ? ' · 还差 ' + rec.missing + ' 篇（点一下看是哪几篇）' : ' · 清单已全部归档');
+      if (diag) badgeDiag(el.textContent + '（平台声明 ' + rec.declared + ' · 来源 ' + rec.source + '）');
+    } catch (e) { /* 徽标是附加显示，失败不影响其它功能 */ }
+  }
+
   function scheduleCheck() {
     let t = null;
     const fire = () => { if (t) clearTimeout(t); t = setTimeout(() => runExtract(), 300); };
@@ -635,10 +826,13 @@
   }
 
   async function init() {
-    // 默认折叠/展开由设置决定
+    // 默认折叠/展开由设置决定。
+    // ⚠ 判据必须是"**明确**选了展开才展开"：默认值只声明在 popup.html（collapsed）与 README，
+    // 而 popup 只在用户手动改过时才写 storage。之前写成 `!(mode === 'collapsed')`，
+    // 于是"从没设置过"= 展开 —— 每次打开小红书面板都自己弹出来（用户实测报障）。
     try {
       const r = await chrome.storage.local.get('panelMode');
-      panelOpen = !(r && r.panelMode === 'collapsed');
+      panelOpen = !!(r && r.panelMode === 'expanded');
     } catch (e) { panelOpen = false; }
     initSettings();
     ensureUI();

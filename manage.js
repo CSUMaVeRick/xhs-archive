@@ -1,4 +1,4 @@
-/**
+﻿/**
  * XHS Archive - 归档管理页（浏览 + 人工标注）
  *
  * 职责：
@@ -699,8 +699,44 @@ async function loadAuthors() {
   let file = null;
   try { file = await readJsonFile(rootHandle, SCH.AUTHORS_FILE); } catch (e) { file = null; }
   authors = SCH.buildAuthorRows((file && file.authors) || {}, notes);
+  await loadAuthorManifests();
   applyAuthorFilter();
 }
+
+// 作者笔记清单（页面侧写进 _meta/authors/<userId>.json）：用于"还差哪几篇"的对账。
+// 只读它来对账，不据此自动归档任何东西 —— 详情仍由人工逐篇归档。
+let authorManifests = {};   // userId -> 清单文件内容
+
+function noteUrlOf(n) {
+  const id = SCH.normalizeNoteId(n && n.noteId);
+  if (!id) return '';
+  let url = 'https://www.xiaohongshu.com/explore/' + id;
+  const q = [];
+  if (n && n.xsecToken) q.push('xsec_token=' + encodeURIComponent(String(n.xsecToken)));
+  if (n && n.sourceQuery) q.push(n.sourceQuery);
+  return q.length ? (url + '?' + q.join('&')) : url;
+}
+
+async function loadAuthorManifests() {
+  authorManifests = {};
+  if (!rootHandle) return;
+  let dir = null;
+  try { dir = await rootHandle.getDirectoryHandle('_meta'); dir = await dir.getDirectoryHandle('authors'); } catch (e) { return; }
+  try {
+    for await (const [name, handle] of dir.entries()) {
+      if (handle.kind !== 'file' || !/\.json$/i.test(name)) continue;
+      try {
+        const obj = JSON.parse(await (await handle.getFile()).text());
+        const uid = (obj && obj.author && obj.author.userId) || name.replace(/\.json$/i, '');
+        if (uid) authorManifests[uid] = obj;
+      } catch (e) { /* 单个文件坏了不影响其它 */ }
+    }
+  } catch (e) { /* 目录不可读（未授权）时静默：对账是附加信息，不该阻断主流程 */ }
+}
+
+// 对账：平台声明几篇 / 清单见过几篇 / 已归档几篇 / 还差哪几篇
+// 实现只有一处（schema.buildAuthorReconcile，有单测）：清单里的 `archived` 标记由每次归档顺手写入，
+// 所以这里**不需要**遍历所有 metadata.json。页面版面板用的是同一个函数，口径不会分叉。
 
 function applyAuthorFilter() {
   const q = ($('author-search').value || '').trim().toLowerCase();
@@ -737,13 +773,20 @@ function renderAuthors() {
   head.className = 'author-row author-head';
   head.innerHTML = '<span class="a-name">作者</span><span>小红书号</span><span class="a-num">粉丝</span>'
     + '<span class="a-num">关注</span><span class="a-num">笔记</span><span class="a-num">获赞与收藏</span>'
-    + '<span>认证</span><span>属地</span><span class="a-num">已归档</span><span>最近观测</span>';
+    + '<span>认证</span><span>属地</span><span class="a-num">已归档</span>'
+    + '<span class="a-num" title="已抓到的清单 / 还没归档的篇数">清单 / 未归档</span><span>最近观测</span>';
   box.appendChild(head);
 
   for (const a of authorsFiltered) {
     const row = document.createElement('div');
     row.className = 'author-row';
     const recent = String(a.checkedAt || '').slice(0, 16).replace('T', ' ');
+    const rec = authorManifests[a.userId]
+      ? SCH.buildAuthorReconcile(authorManifests[a.userId], SCH.archivedIdsOfManifest(authorManifests[a.userId]))
+      : null;
+    const recText = rec
+      ? (rec.missing ? `<b class="a-miss" title="回到该作者主页滚一次可刷新清单">${rec.listed} / ${rec.missing}</b>` : `${rec.listed} / 0`)
+      : '<span class="a-dim">—</span>';
     row.innerHTML = `<span class="a-name">${esc(a.nickname || '(无昵称)')}${a.historyCount ? ` <b class="a-hist" title="数值变过 ${a.historyCount} 次">↻${a.historyCount}</b>` : ''}</span>`
       + `<span class="a-dim">${esc(a.redId || '—')}</span>`
       + `<span class="a-num">${a.fansCount == null ? '—' : a.fansCount}</span>`
@@ -753,6 +796,7 @@ function renderAuthors() {
       + `<span>${a.verified ? esc(a.verifyText || '已认证') : '—'}</span>`
       + `<span class="a-dim">${esc(a.ipLocation || '—')}</span>`
       + `<span class="a-num">${a.archivedNotes || 0}</span>`
+      + `<span class="a-num">${recText}</span>`
       + `<span class="a-dim">${esc(recent || '—')}</span>`;
     row.addEventListener('click', () => showAuthor(a));
     box.appendChild(row);
@@ -785,10 +829,34 @@ function showAuthor(a) {
     ? mine.map((n, i) => `<div class="author-note" data-idx="${i}"><b>${esc(n.meta.title || '(无标题)')}</b><span>${esc(n.meta._archiveDate || '')}</span></div>`).join('')
     : '<div class="muted">我们没有归档这位作者的笔记</div>';
 
+  // 清单对账：还差哪几篇（清单来自页面侧抓到的作者作品列表；链接里的 xsec_token 会过期）
+  const manifest = authorManifests[a.userId] || null;
+  const rec = manifest ? SCH.buildAuthorReconcile(manifest, SCH.archivedIdsOfManifest(authorManifests[a.userId])) : null;
+  let reconcileHtml = '';
+  if (rec) {
+    const when = rec.capturedAt ? String(rec.capturedAt).slice(0, 16).replace('T', ' ') : '—';
+    const declaredText = rec.declared == null ? '平台未声明' : (rec.declared + ' 篇');
+    const head = `平台声明 ${declaredText} · 已抓到清单 ${rec.listed} 篇 · 已归档 ${rec.archived} 篇`
+      + (rec.missing ? ` · <b class="a-miss">还差 ${rec.missing} 篇</b>` : ' · 清单已全部归档');
+    const tip = `清单抓取时间 ${when}（来源：${rec.source === 'bridge' ? '接口' : '页面'}）。`
+      + `清单里的链接含 <code>xsec_token</code>，会过期；过期就回作者主页滚一次再回来。`;
+    const missHtml = rec.notArchived.slice(0, 200).map((n) => {
+      const url = noteUrlOf(n);
+      const title = esc(n.title || '(无标题)');
+      return `<div class="author-note"><b><a href="${esc(url)}" target="_blank" rel="noopener">${title}</a></b>`
+        + `<span>${esc(String(n.noteId || '').slice(0, 8))}…${n.hasVideo ? ' · 视频' : ''}</span></div>`;
+    }).join('');
+    reconcileHtml = `<div class="anno-field"><div class="anno-label">与平台清单对账</div>`
+      + `<div class="muted">${head}<br>${tip}</div>`
+      + (rec.missing ? `<div class="muted" style="margin-top:6px">还没归档的（点标题打开原帖，逐篇归档仍用页面上的 📥）：</div>${missHtml}` : '')
+      + `</div>`;
+  }
+
   $('preview-content').innerHTML = `
     <h2 class="pv-title">${esc(a.nickname || '(无昵称)')}</h2>
     <div class="pv-meta">作者档案 · userId <code>${esc(a.userId)}</code></div>
     <div class="anno-section">${info}</div>
+    ${reconcileHtml}
     <div class="anno-field"><div class="anno-label">我们归档的笔记（${mine.length} 篇）</div>${listHtml}</div>
     ${a.profileUrl ? `<div class="pv-link"><a href="${esc(a.profileUrl)}" target="_blank" rel="noopener">打开小红书主页</a></div>` : ''}
   `;

@@ -123,6 +123,105 @@ for (const file of ['content/archive.js', 'popup.js']) {
   if (!ok) bad++;
 }
 
+// 交叉检查 4：对账逻辑只有一处实现（schema.buildAuthorReconcile），管理页与页面面板共用 -> 口径不会分叉
+{
+  const mSrc = fs.readFileSync(path.join(root, 'manage.js'), 'utf8');
+  const pSrc = fs.readFileSync(path.join(root, 'content/main.js'), 'utf8');
+  const mOk = /SCH\.buildAuthorReconcile\(/.test(mSrc) && !/^\s*function buildAuthorReconcile\(/m.test(mSrc);
+  const pOk = /S\.buildAuthorReconcile\(/.test(pSrc);
+  console.log(`${mOk && pOk ? 'reconcile OK  ' : 'reconcile MISS'} 管理页与页面面板共用 schema.buildAuthorReconcile`);
+  if (!(mOk && pOk)) bad++;
+}
+
+// 对账纯函数（含"清单里已归档标记"这条主路径）
+{
+  const manifest = {
+    author: { declaredNoteCount: 5 },
+    coverage: { capturedAt: '2026-05-01T00:00:00.000Z', source: 'bridge' },
+    notes: [
+      { noteId: '6a39f801000000002100ac4c', title: '一', xsecToken: 'T', archived: true },
+      { noteId: '68e90be80000000004022e66', title: '二' },
+      { noteId: '68e90be80000000004022e99', title: '三' },
+    ],
+  };
+  const rec = SCHEMA.buildAuthorReconcile(manifest, SCHEMA.archivedIdsOfManifest(manifest));
+  eq('对账 声明/清单/已归档/未归档 四个数', [rec.declared, rec.listed, rec.archived, rec.missing], [5, 3, 1, 2]);
+  eq('对账 未归档清单只含没归档的', rec.notArchived.map((n) => n.noteId), ['68e90be80000000004022e66', '68e90be80000000004022e99']);
+  eq('对账 清单全归档时 missing 为 0', SCHEMA.buildAuthorReconcile(
+    { notes: manifest.notes.map((n) => Object.assign({}, n, { archived: true })) },
+    SCHEMA.archivedIdsOfManifest({ notes: manifest.notes.map((n) => Object.assign({}, n, { archived: true })) })
+  ).missing, 0);
+  eq('对账 没有清单时返回空', [SCHEMA.buildAuthorReconcile(null, {}).listed, SCHEMA.buildAuthorReconcile(null, {}).declared], [0, null]);
+  // 归档时写入的 archived 标记必须能被对账读到（面板在主页就靠它）
+  eq('对账 已归档标记来自清单本身', Object.keys(SCHEMA.archivedIdsOfManifest(manifest)), ['6a39f801000000002100ac4c']);
+}
+
+// 徽标文案：只从 main.js 里取 updateToolbarBadge 出来、喂假 DOM 运行（真跑一遍，不靠肉眼）
+{
+  const mSrc = fs.readFileSync(path.join(root, 'content/main.js'), 'utf8');
+  const start = mSrc.indexOf('function updateToolbarBadge');
+  const end = mSrc.indexOf('\n  }', start) + 4;
+  const src = mSrc.slice(start, end);
+  const badge = { style: {}, textContent: '', title: '', classList: { toggle: (cls, on) => { badge['cls:' + cls] = !!on; } } };
+  const tb = { querySelector: () => badge };
+  const env = {
+    console: { log: () => {} },
+    document: { getElementById: (id) => (id === 'xhs-tb' ? tb : null) },
+    window: { XHS_SCHEMA: SCHEMA },
+    profilePageUserId: () => 'u1',
+    authorManifest: null,
+    badgeDiagLast: '',
+    badgeDiag: () => {},
+  };
+  env.window.window = env.window;
+  vm.createContext(env);
+  vm.runInContext(src + '\nglobalThis.__badge = updateToolbarBadge;', env, { filename: 'badge.js' });
+  const manifest = {
+    author: { userId: 'u1', declaredNoteCount: 18 },
+    coverage: { source: 'bridge', capturedAt: '2026-05-01T00:00:00.000Z' },
+    notes: [
+      { noteId: '6a39f801000000002100ac4c', title: '一', archived: true },
+      { noteId: '68e90be80000000004022e66', title: '二' },
+    ],
+  };
+  env.authorManifest = manifest;
+  env.__badge();
+  eq('徽标 显示 已归档/清单', badge.textContent, '1/2');
+  // 关键：可见时必须给**具体的 display 值**。写 '' 会退回 CSS 的 display:none —— 文字有、但看不见
+  eq('徽标 可见时给了具体 display（不能是空串）', badge.style.display, 'inline-block');
+  eq('徽标 有未归档时不加 is-done', badge['cls:is-done'], false);
+  eq('徽标 提示语含"还差"', /还差 1 篇/.test(badge.title), true);
+  // 清单全部归档 → 变淡
+  env.authorManifest = { author: manifest.author, coverage: manifest.coverage, notes: manifest.notes.map((n) => Object.assign({}, n, { archived: true })) };
+  env.__badge();
+  eq('徽标 全部归档显示满格', badge.textContent, '2/2');
+  eq('徽标 全部归档时标 is-done', badge['cls:is-done'], true);
+  // 不在作者主页 → 隐藏
+  env.authorManifest = manifest;
+  env.profilePageUserId = () => '';
+  env.__badge();
+  eq('徽标 非作者主页时隐藏', badge.style.display, 'none');
+  // 还没有清单 → 隐藏（面板里会给"往下滚一屏"的提示）
+  env.profilePageUserId = () => 'u1';
+  env.authorManifest = null;
+  env.__badge();
+  eq('徽标 没有清单时隐藏', badge.style.display, 'none');
+}
+
+// 可见性交叉检查：CSS 默认隐藏的元素，"显示"时必须给**具体的 display 值**。
+// 只断言 textContent 抓不到这类 bug —— 实测踩过：徽标显示时写成 display=''，
+// 等于移除 inline 样式、退回 CSS 的 display:none，于是"有数字却永远看不见"。
+{
+  const css = fs.readFileSync(path.join(root, 'content/debug-panel.css'), 'utf8');
+  const rule = css.match(/\.xhs-tb-badge\s*\{([^}]*)\}/);
+  const defaultsHidden = !!(rule && /display\s*:\s*none/.test(rule[1]));
+  const mSrc = fs.readFileSync(path.join(root, 'content/main.js'), 'utf8');
+  const badgeSrc = mSrc.slice(mSrc.indexOf('function updateToolbarBadge'), mSrc.indexOf('function updateToolbarBadge') + 2600);
+  const ok = defaultsHidden && !/style\.display\s*=\s*''/.test(badgeSrc) && /style\.display\s*=\s*'inline-block'/.test(badgeSrc);
+  console.log(`${ok ? 'visible OK  ' : 'visible MISS'} 徽标：CSS 默认隐藏 ${defaultsHidden}，显示时给了具体 display`);
+  if (!ok) bad++;
+}
+
 // ---------- schema 助手单测 ----------
 function eq(label, actual, expected) {
   const a = JSON.stringify(actual);
@@ -790,9 +889,80 @@ eq('评论 来源标注 state', cm1.sources, ['state']);
 netC.sandbox.__XHS_STATE_INGEST__();
 eq('评论 重复采集会去重', JSON.parse(netC.els['xhs-note-comments'].textContent).list.length, 3);
 
+// ---------- 作者主页笔记清单通道（对账用，不做自动归档） ----------
+// 与笔记缓存 MAP 刻意隔离：主页列表的薄卡片不能挤进"当前笔记"候选池
+const authorNotesUrl = 'https://edith.xiaohongshu.com/api/sns/web/v1/user_posted?num=30&cursor=&user_id=u1';
+const authorNotesPayload = {
+  code: 0, success: true,
+  data: {
+    has_more: true, cursor: 'next1', note_count: 42,
+    notes: [
+      { id: 'a1', xsec_token: 'TOK_A1', note_card: {
+        display_title: '第一篇', type: 'normal',
+        user: { user_id: 'u1', nickname: '甲' },
+        interact_info: { liked_count: '17', collected_count: '3', comment_count: '2', shared_count: '2', liked: true, collected: true },
+        cover: { url_default: 'http://s.c/x.jpg' },
+        image_list: [{ info_list: [{ image_scene: 'WB_DFT', url: 'http://a/1.jpg' }] }],
+      } },
+    ],
+  },
+};
+const envAuthor = buildNetEnv({ noteId: 'n1' });
+// 走真实 XHR 链路：请求参数（user_id/cursor/num）在 query 里，由 hook 在 send() 时记下
+const axhr = new envAuthor.sandbox.XMLHttpRequest();
+axhr.open('GET', authorNotesUrl);
+axhr.send();
+axhr.status = 200; axhr.responseType = ''; axhr.responseText = JSON.stringify(authorNotesPayload);
+for (const fn of (axhr.__listeners && axhr.__listeners.load) || []) fn.call(axhr);
+const anBatches = envAuthor.sandbox.__XHS_AUTHOR_NOTES__();
+eq('作者清单 收到一批', anBatches.length, 1);
+eq('作者清单 条目数与请求参数', [anBatches[0].notes.length, anBatches[0].req.userId, anBatches[0].req.num], [1, 'u1', '30']);
+eq('作者清单 记录 has_more 与 cursor', [anBatches[0].hasMore, anBatches[0].nextCursor], [true, 'next1']);
+eq('作者清单 记录平台声明篇数', anBatches[0].noteCount, 42);
+eq('作者清单 保留 noteId 与 xsecToken', [anBatches[0].notes[0].noteId, anBatches[0].notes[0].xsecToken], ['a1', 'TOK_A1']);
+eq('作者清单 浏览者状态字段被丢掉', anBatches[0].notes[0].countsRaw.liked, undefined);
+eq('作者清单 计数只取四个 count', anBatches[0].notes[0].countsRaw.likeCount, '17');
+eq('作者清单 不进笔记缓存（不与 MAP 混）', Object.keys(envAuthor.sandbox.__XHS_NOTE_API__ || {}).length, 0);
+// 内容脚本取走后写回 ack；下一次刷新丢弃已消费的批次
+envAuthor.els['xhs-author-notes-ack'] = { id: 'xhs-author-notes-ack', style: {}, textContent: JSON.stringify({ consumed: 1 }) };
+envAuthor.sandbox.__XHS_INGEST__({ data: { notes: [{ id: 'a2', note_card: { display_title: 'b' } }] } }, authorNotesUrl);
+eq('作者清单 ack 后丢弃已消费批次', envAuthor.sandbox.__XHS_AUTHOR_NOTES__().length, 1);
+// 隐私边界：不该碰的接口仍然不碰
+const envAuthorSkip = buildNetEnv({ noteId: 'n1' });
+envAuthorSkip.sandbox.__XHS_INGEST__({ data: { notes: [{ id: 'a3', note_card: { display_title: 'c' } }] } }, 'https://edith.xiaohongshu.com/api/sns/web/v1/feed');
+eq('作者清单 只认 user_posted 接口', envAuthorSkip.sandbox.__XHS_AUTHOR_NOTES__().length, 0);
+
+// ---------- 清单合并与对账纯函数（schema） ----------
+const anBase = SCHEMA.mergeAuthorNotes(null, [
+  { noteId: '6a39f801000000002100ac4c', title: '一', xsecToken: 'T1' },
+  { noteId: '6a39f801000000002100ac4c', title: '一重复' },
+  { noteId: 'bad-id', title: '不是笔记' },
+], '2026-01-01T00:00:00.000Z');
+eq('清单合并 非法 id 丢弃且去重', [anBase.total, anBase.added], [1, 1]);
+eq('清单合并 记下首次见到时间', Object.values(anBase.notes)[0].firstSeenAt, '2026-01-01T00:00:00.000Z');
+eq('清单合并 新条目默认未归档', Object.values(anBase.notes)[0].archived, false);
+const anSecond = SCHEMA.mergeAuthorNotes(anBase, [
+  { noteId: '6a39f801000000002100ac4c', title: '一改' },
+  { noteId: '68e90be80000000004022e66', title: '二' },
+], '2026-02-02T00:00:00.000Z');
+eq('清单合并 只增不减且保留首次时间', [
+  anSecond.total,
+  anSecond.added,
+  anSecond.notes['6a39f801000000002100ac4c'].firstSeenAt,
+  anSecond.notes['6a39f801000000002100ac4c'].lastSeenAt,
+], [2, 1, '2026-01-01T00:00:00.000Z', '2026-02-02T00:00:00.000Z']);
+eq('清单合并 标题被更新', anSecond.notes['6a39f801000000002100ac4c'].title, '一改');
+// 已归档标记不能被后续扫描清掉（否则管理页会把归档过的又列成"未归档"）
+const anArchived = SCHEMA.mergeAuthorNotes(
+  { notes: [{ noteId: '6a39f801000000002100ac4c', title: '一', archived: true, firstSeenAt: '2026-01-01T00:00:00.000Z' }] },
+  [{ noteId: '6a39f801000000002100ac4c', title: '一' }],
+  '2026-03-03T00:00:00.000Z'
+);
+eq('清单合并 已归档标记只增不减', anArchived.notes['6a39f801000000002100ac4c'].archived, true);
+eq('noteId 归一化只认 24 位 hex', SCHEMA.normalizeNoteId('https://www.xiaohongshu.com/explore/6a39F801000000002100AC4C?x=1'), '6a39f801000000002100ac4c');
+
 // 滚动时页面自己请求的评论接口（普通页）
-netC.sandbox.__XHS_INGEST__(
-  { data: { comments: [{ id: 'c3', content: '第三条', userInfo: { userId: 'u4', nickname: '丁' } }], cursor: 'cur2', has_more: true } },
+netC.sandbox.__XHS_INGEST__(  { data: { comments: [{ id: 'c3', content: '第三条', userInfo: { userId: 'u4', nickname: '丁' } }], cursor: 'cur2', has_more: true } },
   'https://edith.xiaohongshu.com/api/sns/web/v2/comment/page?note_id=n1&cursor=cur1&top_comment_id=&image_formats=jpg'
 );
 const cm2 = JSON.parse(netC.els['xhs-note-comments'].textContent);

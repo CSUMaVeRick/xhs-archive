@@ -227,7 +227,37 @@ async function archiveNote(rootHandle, note) {
   // 漂移自检：字段清单与实际写入的 metadata 对比，缺键说明某条路径没同步改
   const missingKeys = sch && sch.checkMetaKeys ? sch.checkMetaKeys(meta) : [];
 
+  // 顺手刷新作者清单里的"已归档"标记。
+  // 弹窗归档用的是**扩展源**的目录句柄（页面源那个读不到），所以两条路径各写一次；
+  // 不写的话，用弹窗归档的笔记会在面板对账里被误报成"还差"。
+  try { await markArchivedInAuthorManifest(rootHandle, note); } catch (e) { /* 对账是附加信息，失败不影响归档 */ }
+
   return { ok, fail, noteFolderName, videoOk, videoErr, videoCoverOnly, missingKeys };
+}
+
+async function markArchivedInAuthorManifest(rootHandle, note) {
+  const sch = window.XHS_SCHEMA || null;
+  if (!sch || !sch.mergeAuthorNotes || !sch.normalizeNoteId) return;
+  const userId = (note && note._author && note._author.userId) || (note && note.author && note.author.userId) || '';
+  const noteId = sch.normalizeNoteId(note && note.noteId);
+  if (!userId || !noteId) return;
+  const metaDir = await getDir(rootHandle, '_meta');
+  const dir = await getDir(metaDir, 'authors');
+  const fileName = userId + '.json';
+  let manifest = null;
+  try {
+    const fh = await dir.getFileHandle(fileName);
+    manifest = JSON.parse(await (await fh.getFile()).text());
+  } catch (e) { return; } // 还没抓到这位作者的清单：不凭空造一个
+  const list = Array.isArray(manifest && manifest.notes) ? manifest.notes : [];
+  const idx = list.findIndex((n) => n && n.noteId === noteId);
+  if (idx < 0) return; // 不在清单里就不动（避免把清单变成"归档流水"）
+  const next = list.slice();
+  next[idx] = Object.assign({}, next[idx], { archived: true });
+  await writeFile(dir, fileName, JSON.stringify(Object.assign({}, manifest, {
+    notes: next,
+    coverage: Object.assign({}, manifest.coverage || {}, { archivedAt: new Date().toISOString() }),
+  }), null, 2));
 }
 
 // ---------- UI ----------

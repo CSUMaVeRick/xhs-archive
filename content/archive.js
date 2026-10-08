@@ -198,17 +198,73 @@
     if (!root) {
       // 第一次：让用户选一次归档目录
       root = await pickRoot();
-      return await writeNote(root, note);
+      return await writeNoteAndMark(root, note);
     }
     // 已有句柄：先用点击手势重新授权并写入，避免每次都重新弹目录选择框
     try { await root.requestPermission({ mode: 'readwrite' }); } catch (e) {}
     try {
-      return await writeNote(root, note);
+      return await writeNoteAndMark(root, note);
     } catch (e) {
       if (e && e.code === 'NOTE_ID_MISMATCH') throw e;
       // 写失败（权限变了）才重新选目录兜底
       root = await pickRoot();
-      return await writeNote(root, note);
+      return await writeNoteAndMark(root, note);
+    }
+  }
+
+  // 每次归档顺手把清单里的"已归档"标记刷新一下（一个作者一个小文件，代价可忽略）。
+  // 这样"作者主页上就能看到还差哪几篇"，且**不需要遍历数千个 metadata.json** —— 页面源句柄
+  // 不能读扩展源选的目录（见 docs/DESIGN.md 的双句柄域），遍历不可行。
+  async function writeNoteAndMark(root, note) {
+    const res = await writeNote(root, note);
+    try { await markArchivedInManifest(root, note); } catch (e) { /* 对账信息是附加的，失败不影响归档 */ }
+    return res;
+  }
+
+  async function markArchivedInManifest(root, note) {
+    const sch = schema();
+    if (!sch || !sch.mergeAuthorNotes) return null;
+    const userId = (note && note._author && note._author.userId) || (note && note.author && note.author.userId) || '';
+    const noteId = sch.normalizeNoteId ? sch.normalizeNoteId(note && note.noteId) : String((note && note.noteId) || '');
+    if (!userId || !noteId) return null;
+    const dir = await getDir(await getDir(root, '_meta'), 'authors');
+    const fileName = userId + '.json';
+    let manifest = null;
+    try {
+      const fh = await dir.getFileHandle(fileName);
+      manifest = JSON.parse(await (await fh.getFile()).text());
+    } catch (e) { return null; } // 还没抓到这位作者的清单：不用凭空造一个
+    const list = Array.isArray(manifest && manifest.notes) ? manifest.notes : [];
+    if (!list.some((n) => n && n.noteId === noteId)) return null; // 不在清单里就不动（避免把清单变成"归档流水"）
+    const merged = sch.mergeAuthorNotes(manifest, list.map((n) => Object.assign({}, n, n.noteId === noteId ? { archived: true } : null)), new Date().toISOString());
+    const notes = Object.values(merged.notes).map((n) => Object.assign({}, n, { archived: n.noteId === noteId ? true : !!n.archived }));
+    const out = Object.assign({}, manifest, {
+      notes: notes,
+      coverage: Object.assign({}, manifest.coverage || {}, { archivedAt: new Date().toISOString() }),
+    });
+    await writeFile(dir, fileName, JSON.stringify(out, null, 2));
+    return out;
+  }
+
+  // 读某位作者的清单（供面板在作者主页直接显示对账），带一份内存缓存
+  let notesManifestCache = {};   // userId -> manifest
+  async function readAuthorNotes(userId, force) {
+    const sch = schema();
+    if (!userId) return null;
+    const cached = notesManifestCache[userId];
+    if (cached && !force) return cached;
+    const root = await getRootHandle();
+    if (!root) return cached || null;
+    try {
+      const dir = await getDir(await getDir(root, '_meta'), 'authors');
+      const fh = await dir.getFileHandle(userId + '.json');
+      const obj = JSON.parse(await (await fh.getFile()).text());
+      notesManifestCache[userId] = obj;
+      return obj;
+    } catch (e) {
+      // 文件不存在：可能是还没抓到过清单，也可能是权限过期 —— 都不打扰用户，返回缓存或 null
+      notesManifestCache[userId] = cached || null;
+      return cached || null;
     }
   }
 
@@ -261,5 +317,77 @@
     }
   }
 
-  window.__XHS_ARCHIVE__ = { archive, archiveAuthors, hasRoot: () => getRootHandle().then(Boolean) };
+  // ---------- 作者笔记清单（对账用，写 _meta/authors/<userId>.json） ----------
+  // 只写清单，不碰笔记目录；管理页拿它跟"已归档的 metadata.json"对账，回答"还差哪几篇"。
+  // 注意：清单里的链接（含 xsec_token）是页面加载那一刻抓到的，会过期 —— 它只是路标，不承诺可直开。
+  const AUTHORS_DIR = '_meta/authors';
+  const AUTHOR_NOTES_SCHEMA = 1;
+
+  async function writeJsonFile(root, dirPath, name, obj) {
+    const parts = String(dirPath).split('/').filter(Boolean);
+    let dir = root;
+    for (const p of parts) dir = await getDir(dir, p);
+    await writeFile(dir, name, JSON.stringify(obj, null, 2));
+  }
+
+  async function saveAuthorNotes(manifest, authorInfo) {
+    const sch = schema();
+    if (!manifest || !manifest.userId) return { ok: false, error: '缺少作者 userId' };
+    if (!sch || !sch.mergeAuthorNotes) return { ok: false, error: 'schema 模块未加载' };
+
+    let root = await getRootHandle();
+    if (!root) { root = await pickRoot(); return await doSaveAuthorNotes(root, manifest, authorInfo); }
+    try { await root.requestPermission({ mode: 'readwrite' }); } catch (e) {}
+    try {
+      return await doSaveAuthorNotes(root, manifest, authorInfo);
+    } catch (e) {
+      root = await pickRoot();
+      return await doSaveAuthorNotes(root, manifest, authorInfo);
+    }
+  }
+
+  async function doSaveAuthorNotes(root, manifest, authorInfo) {
+    const sch = schema();
+    const dir = await getDir(await getDir(root, '_meta'), 'authors');
+    const fileName = manifest.userId + '.json';
+    let existing = null;
+    try {
+      const fh = await dir.getFileHandle(fileName);
+      existing = JSON.parse(await (await fh.getFile()).text());
+    } catch (e) { existing = null; } // 不存在或损坏都按"从空开始"
+
+    const now = new Date().toISOString();
+    const merged = sch.mergeAuthorNotes(existing, manifest.notes, now);
+    // 平台声明的篇数：只增不减（后端有时不返回 note_count，别把已知值覆盖成 null）
+    const declared = manifest.declaredNoteCount != null
+      ? manifest.declaredNoteCount
+      : ((existing && existing.author && existing.author.declaredNoteCount) || null);
+    const out = {
+      _type: 'authorNotes',
+      schemaVersion: AUTHOR_NOTES_SCHEMA,
+      pluginVersion: sch.pluginVersion ? sch.pluginVersion() : '',
+      author: Object.assign({}, (existing && existing.author) || {}, authorInfo || {}, {
+        userId: manifest.userId,
+        declaredNoteCount: declared,
+        capturedAt: now,
+      }),
+      coverage: {
+        notes: merged.total,
+        hasMore: manifest.hasMore === undefined ? null : manifest.hasMore,
+        cursorLast: manifest.cursorLast || null,
+        source: manifest.source || 'unknown',
+        droppedBatches: manifest.droppedBatches || 0,
+        capturedAt: now,
+      },
+      notes: Object.values(merged.notes).sort((a, b) => String(a.firstSeenAt || '').localeCompare(String(b.firstSeenAt || ''))),
+      _note: '清单只用于对账（平台上有几篇 / 我们见过哪几篇 / 还差哪几篇）；详情仍由人工逐篇归档。链接里的 xsec_token 会过期。',
+    };
+    await writeFile(dir, fileName, JSON.stringify(out, null, 2));
+    return { ok: true, file: AUTHORS_DIR + '/' + fileName, added: merged.added, total: merged.total, declared: declared };
+  }
+
+  window.__XHS_ARCHIVE__ = {
+    archive, archiveAuthors, saveAuthorNotes, readAuthorNotes, markArchivedInManifest,
+    hasRoot: () => getRootHandle().then(Boolean),
+  };
 })();
